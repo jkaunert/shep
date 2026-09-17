@@ -413,7 +413,13 @@ export class GitPrService implements IGitPrService {
         };
       }
 
-      if (workflowStatus.status === 'pending' || prCheckStatus.status === 'pending') {
+      // A missing workflow run is neutral when PR checks are also neutral
+      // (for example, a repository with no Actions and no configured checks).
+      // Preserve pending when an external PR check is still running.
+      if (
+        prCheckStatus.status === 'pending' ||
+        (workflowStatus.status === 'pending' && workflowStatus.runUrl)
+      ) {
         return { status: 'pending', runUrl: workflowStatus.runUrl };
       }
 
@@ -474,9 +480,7 @@ export class GitPrService implements IGitPrService {
 
       return { status: 'success' };
     } catch (error) {
-      const errorDetails = (
-        typeof error === 'object' && error !== null ? error : {}
-      ) as {
+      const errorDetails = (typeof error === 'object' && error !== null ? error : {}) as {
         code?: number | string;
         stdout?: string;
         stderr?: string;

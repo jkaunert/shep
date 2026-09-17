@@ -1869,3 +1869,14 @@ check runs — the guard never gets a chance to skip that first stale write.
    constructed object on every branch. React's `setState` bails out on
    referential equality, so returning the same reference silently skips a
    re-render that downstream effects may depend on.
+
+## A missing CI run URL is not proof of CI success
+
+When a repository has no GitHub Actions runs, `getCiStatus()` can still report
+pending or failed external PR checks. The CI watch loop must preserve that
+status; treating every URL-less result as success turns unresolved branch
+protection checks into a false green.
+
+**Rule:** Only the explicit no-workflow/no-checks case is neutral success. A
+pending or failed PR check must remain pending or failed through the merge-node
+path, with regression tests covering both no-Actions cases.

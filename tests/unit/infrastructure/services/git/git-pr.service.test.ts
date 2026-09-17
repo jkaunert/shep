@@ -471,14 +471,14 @@ describe('GitPrService', () => {
       expect(result.runUrl).toBe('https://github.com/org/repo/actions/runs/123');
     });
 
-    it('should return pending when no runs found', async () => {
+    it('should return success when no workflow runs or PR checks are found', async () => {
       vi.mocked(mockExec)
         .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
         .mockResolvedValueOnce({ stdout: JSON.stringify([]), stderr: '' });
 
       const result = await service.getCiStatus('/repo', 'feat/branch');
 
-      expect(result.status).toBe('pending');
+      expect(result.status).toBe('success');
     });
 
     it('should throw GitPrError when gh command fails', async () => {
@@ -646,7 +646,7 @@ describe('GitPrService', () => {
       expect(result.status).toBe('success');
     });
 
-    it('should not throw when no workflow runs or PR checks are reported', async () => {
+    it('should return success when no workflow runs or PR checks are reported', async () => {
       const noChecksError = new Error(
         'Command failed: gh pr checks feat/branch --json bucket,state,name'
       ) as Error & { code: number; stderr: string };
@@ -659,9 +659,36 @@ describe('GitPrService', () => {
 
       const result = await service.getCiStatus('/repo', 'feat/branch');
 
-      // The no-run signal remains pending here; runCiWatchFixLoop uses the
-      // missing runUrl to skip CI watching successfully.
+      expect(result).toEqual({ status: 'success' });
+    });
+
+    it('should preserve pending PR checks when no workflow runs exist', async () => {
+      vi.mocked(mockExec)
+        .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify([
+            { bucket: 'pending', state: 'IN_PROGRESS', name: 'External CI' },
+          ]),
+          stderr: '',
+        });
+
+      const result = await service.getCiStatus('/repo', 'feat/branch');
+
       expect(result).toEqual({ status: 'pending' });
+    });
+
+    it('should preserve failed PR checks when no workflow runs exist', async () => {
+      vi.mocked(mockExec)
+        .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
+        .mockResolvedValueOnce({
+          stdout: JSON.stringify([{ bucket: 'fail', state: 'FAILURE', name: 'External CI' }]),
+          stderr: '',
+        });
+
+      const result = await service.getCiStatus('/repo', 'feat/branch');
+
+      expect(result.status).toBe('failure');
+      expect(result.logExcerpt).toContain('External CI');
     });
 
     it('should return pending when gh pr checks exits with its pending status code', async () => {
