@@ -20,6 +20,7 @@
  *   shep run          Run an AI agent workflow
  *   shep agent        Manage and view agent runs
  *   shep feat         Manage features through the SDLC lifecycle
+ *   shep dev          Run and inspect a local dev server
  *   shep repo         Manage tracked repositories
  *   shep settings     Configure Shep settings
  *   shep upgrade      Upgrade Shep CLI to the latest version
@@ -45,6 +46,7 @@ import { createFeatCommand } from './commands/feat/index.js';
 import { createRepoCommand } from './commands/repo/index.js';
 import { createAppCommand } from './commands/app/index.js';
 import { createClusterCommand } from './commands/cluster/index.js';
+import { createDevCommand } from './commands/dev/index.js';
 import { createSessionCommand } from './commands/session/index.js';
 import { createIdeOpenCommand } from './commands/ide-open.command.js';
 import { createInstallCommand } from './commands/install.command.js';
@@ -66,6 +68,7 @@ import { createSecurityCommand } from './commands/security.command.js';
 import { createWorkflowCommand } from './commands/workflow/index.js';
 import { createPluginCommand } from './commands/plugin/index.js';
 import { createMcpCommand } from './commands/mcp.command.js';
+import { createFleetCommand } from './commands/fleet/index.js';
 import { messages } from './ui/index.js';
 
 // Daemon lifecycle commands
@@ -156,6 +159,7 @@ async function bootstrap() {
     program.addCommand(createRepoCommand());
     program.addCommand(createAppCommand());
     program.addCommand(createClusterCommand());
+    program.addCommand(createDevCommand());
     program.addCommand(createSessionCommand());
     program.addCommand(createIdeOpenCommand());
     program.addCommand(createInstallCommand());
@@ -177,6 +181,7 @@ async function bootstrap() {
     program.addCommand(createUpgradeCommand());
     program.addCommand(createWorkflowCommand());
     program.addCommand(createMcpCommand());
+    program.addCommand(createFleetCommand());
 
     // Daemon lifecycle commands (task-9)
     program.addCommand(createStartCommand());

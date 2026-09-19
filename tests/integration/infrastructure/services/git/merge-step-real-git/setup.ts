@@ -1,5 +1,6 @@
 import { vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { removeDirWithRetry } from '@tests/helpers/remove-dir.helper.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
@@ -20,10 +21,25 @@ const execFileRaw = promisify(execFileCb);
 /*  ExecFunction adapters                                              */
 /* ------------------------------------------------------------------ */
 
-/** Adapter satisfying the ExecFunction type: passes all calls to the real git binary. */
+/** Adapter satisfying the ExecFunction type: passes all calls to the real git binary.
+ *
+ * Isolates from the host machine's global/system git config. Without this, a
+ * stray `[remote "origin"]` section in the developer's `~/.gitconfig` (even
+ * one with no `url`, e.g. just `prune = true`) leaks into `git remote`
+ * output for every repo — including a freshly-`git init`'d harness repo with
+ * no remote configured — breaking "no remote" test assertions non-
+ * deterministically depending on the machine running the tests. */
 export function makeRealExec(): ExecFunction {
   return (file, args, options) =>
-    execFileRaw(file, args, options ?? {}) as Promise<{ stdout: string; stderr: string }>;
+    execFileRaw(file, args, {
+      ...options,
+      env: {
+        ...process.env,
+        ...(options as { env?: NodeJS.ProcessEnv } | undefined)?.env,
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_SYSTEM: '/dev/null',
+      },
+    }) as Promise<{ stdout: string; stderr: string }>;
 }
 
 /**
@@ -156,14 +172,12 @@ export async function createLocalOnlyHarness(): Promise<{
 
 /** Removes the harness temp directories. Called in afterEach.
  *
- *  `maxRetries` + `retryDelay` shield Windows runners from transient
- *  EBUSY/EPERM errors caused by antivirus, the file indexer, or git
- *  child processes that haven't fully released their handles yet.
- *  Without this, cleanup intermittently fails the whole test even
- *  when the run itself succeeded. */
+ *  Removal is retried so Windows runners survive the transient EBUSY/EPERM
+ *  raised by antivirus, the file indexer, or git child processes that have
+ *  not fully released their handles yet — see `removeDirWithRetry`. */
 export function destroyHarness(dirs: string[]): void {
   for (const dir of dirs) {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    removeDirWithRetry(dir);
   }
 }
 

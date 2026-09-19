@@ -1,5 +1,76 @@
 # Lessons Learned
 
+## `kill()` is a signal, not a join — never remove a directory a process just left
+
+A pty unit test created a temp dir, spawned a real shell in it, called `close()`,
+then removed the dir in `finally`. Green on Linux, red on every Windows run:
+`close()` only *signals* the pty, and Windows keeps the child's handle on its cwd
+open until the process actually dies, so `rmdir` came back `EBUSY` and took the
+whole CI/CD workflow — including the release job — down with it.
+
+Rules:
+
+1. **Wait for the exit event before touching what the process was holding.** Subscribe
+   *before* closing: a session registry drops the entry on close, so a listener added
+   afterwards is never reached.
+2. **`rmSync` retries are the safety net, not the fix.** `maxRetries` / `retryDelay`
+   cover handles the OS releases on its own schedule; they do not make a teardown
+   deterministic, and reaching for them first hides the race.
+3. **A green Linux run says nothing about Windows teardown.** Anything that spawns a
+   process and then deletes files is a Windows-only failure waiting for main.
+4. **One retry budget, one home.** Six suites had each inlined their own
+   `{ maxRetries, retryDelay }`; that is `@tests/helpers/remove-dir.helper.ts` now.
+
+## A one-shot download inside a build step is an unguarded failure
+
+`electron-builder` fetches the Electron runtime from GitHub releases at package time.
+One `status code 500` on the darwin-arm64 zip — seconds after the x64 zip downloaded
+fine — surfaced as `ERR_ELECTRON_BUILDER_CANNOT_EXECUTE` and failed the job.
+
+Rules:
+
+1. **If a build step downloads at run time, wrap it in a retry.** The vendor's own
+   retry logic is not yours to rely on, and everything already fetched is cached, so a
+   retry re-attempts only what failed.
+2. **Retry the seam you control.** No knob exists inside app-builder's downloader, so
+   the outermost process invocation is the only place to put the loop.
+
+## A port with consumers and a token is not a wired port
+
+Spec 111 shipped `IFleetRepository`, four use cases that `@inject('IFleetRepository')`, an exported
+`IFleetRepositoryToken`, and a token smoke test — but no `container.register` call. Every
+`shep fleet *` command resolved its use case, then threw on the unregistered dependency. The
+existing `hollow-dependency-guard` test did not catch it: it enumerates only *class* tokens
+(`if (typeof token !== 'function') continue`), and a repository is registered under a string.
+
+The same commit showed the inverse failure mode. Three use-case files imported their domain types
+from `'../../../../domain/generated/output.js'` — one `..` too deep. The files that imported the
+same path with `import type` were erased at compile time and worked; the three that needed an enum
+*value* crashed at import. The suite reported "Cannot find module" for three files while the
+type-only ones passed, so most of the feature looked green.
+
+**Rules:**
+
+1. A new output port is not done until the DI smoke test resolves it **by the same token the
+   registration uses**. Resolving the use case is not enough — tsyringe constructs an `@injectable`
+   class and only then throws on the missing inner dependency, so the assertion has to name the port.
+2. Prove a resolution test fails without the registration. Delete the `register` call and watch the
+   test go red; a DI test that passes either way is decoration.
+3. `import type` hides broken relative paths. A depth that is wrong by one level compiles fine
+   wherever the symbol is erased, so typecheck cannot be the only gate — run at least one suite that
+   imports the module for its runtime values.
+4. Before adding a constant to `infrastructure/di/tokens.ts`, use it at the registration site. A
+   token exported "for typo safety" that no production file imports is a second spelling of the same
+   string with nothing tying the two together.
+5. Check that spec prose matches the tree it describes. "Builds on PR #847" reads as a foundation;
+   PR #847 was open and conflicting, and no `maxParallelFeatures` existed on `main`. Grep for the
+   symbol before citing a PR as landed.
+6. Two hook traps that cost real time here. `#<number>` anywhere in a body paragraph makes
+   commitlint's parser treat that line as the start of the footer and reject the commit with
+   `footer-leading-blank` — put the reference in its own trailing paragraph. And `.husky/pre-commit`
+   runs `pnpm generate` (prettier'd) *before* lint-staged runs `pnpm tsp:compile` (not prettier'd),
+   so any commit touching a `.tsp` file lands `output.ts` double-quoted and `pnpm format:check`
+   fails until something reformats it.
 ## Two independent gates need two independent markers — never overload a lifecycle
 
 Spec 110 added a parallel-feature cap. A capacity-queued feature and a
@@ -1869,6 +1940,40 @@ macOS, where 1ms barely clears `exec` and nothing had touched the DB yet.
   sequence (kill, kill, run) disproved the first guess in 30s, which is what
   redirected the fix from "harden the assertion" to "stop sharing the home".
 
+## A relative path is meaningless without the directory it is relative to
+
+`validateFileExistence` called `stat(e.relativePath)` on paths like
+`specs/108-dev-server-auto-start/evidence/shot.png`. The evidence agent runs with
+`cwd = state.worktreePath`, but validation runs back in the daemon, so Node
+resolved those paths against the daemon's `process.cwd()` — a different directory
+entirely. Every committed evidence file reported "Evidence file not found", the
+node burned all three `evidenceRetries` re-capturing files that already existed,
+and then degraded to shipping partial evidence. The files were on disk, committed,
+and pushed the whole time.
+
+**Rules:**
+- **A function that consumes a relative path must take its base directory as a
+  parameter.** Not a default, not an ambient `process.cwd()` — a parameter. Every
+  *other* step in this pipeline (`buildExecutorOptions`, `buildEvidencePrompt`,
+  `saveEvidenceManifest`) computed `state.worktreePath || state.repositoryPath`
+  explicitly; validation was the one place that let Node guess, and the guess was
+  wrong everywhere except a developer's own checkout.
+- **`process.cwd()` is a property of the host process, not of the work.** In a
+  daemon that shells agents into worktrees, cwd is never the interesting
+  directory. Treat a bare `stat`/`readFile`/`existsSync` on a relative path in
+  long-lived server code as a bug on sight.
+- **Mocking `fs` hides path-resolution bugs by construction.**
+  `evidence-output-parser.test.ts` stubs `node:fs/promises` wholesale and asserts
+  only the returned strings, so it passed for as long as the defect existed and
+  would have kept passing. Path resolution needs one real-filesystem test with a
+  temp dir and a cwd deliberately pointed elsewhere — mocks agree with whatever
+  you already believe.
+- **When a validator reports that all N items failed, suspect the validator.** A
+  uniform failure across every record is a systemic resolution/config fault, not
+  N independent mistakes. Verify one item by hand (`ls` the path, `git ls-tree`
+  the commit) before regenerating anything — re-capturing evidence would never
+  have fixed this.
+
 ## React Context Over-Rendering and Aggressive Polling Cause UI Lag
 
 **Symptom:** The `shep` web application became extremely laggy, with click interactions taking a long time to react. The application felt unresponsive.
@@ -1898,6 +2003,158 @@ macOS, where 1ms barely clears `exec` and nothing had touched the DB yet.
 When modifying a module's exports (e.g. changing `useAllTurnStatuses` to `useTurnStatusSync`), vitest mocks using `vi.mock()` that return an object missing the expected exports will fail at runtime with `TypeError: (0, ...useTurnStatus) is not a function` or `Error: [vitest] No "useTurnStatusSync" export is defined...`. Vitest strictly verifies that if a module is mocked, any named import actually exists on the mocked object. 
 
 **Rule:** Always search the codebase for `vi.mock('path/to/module')` whenever you rename, add, or remove an exported function from a module, and ensure all test files update their mock returns to match the new signature.
+
+## A per-node "skip if already completed" check must distinguish crash-resume from rejection-rework
+
+`fast-implement.node.ts` unconditionally skipped execution whenever `fast-implement`
+was already in `feature.yaml`'s `completedPhases`. That check exists to make the
+crash/error-resume path idempotent (a fresh `graph.invoke` from `START` after a
+worker crash must not redo finished phases). But `merge.node.ts` also routes back
+to `fast-implement` on a **merge rejection**, setting `_needsReexecution: true` —
+and since `fast-implement` was already marked complete from the first pass, the
+same skip fired, silently discarding the user's rejection feedback and looping
+straight back to merge review. Log symptom: `"Phase already completed, skipping
+execution"` immediately followed by no re-implementation at all.
+
+**Rule:** any node with a hand-rolled `getCompletedPhases().includes(phase)` skip
+guard (i.e. one that doesn't go through the shared `executeNode()` helper in
+`node-helpers.ts`, which already handles this correctly) must also check the
+graph's rework signal (`state._needsReexecution`) before skipping — the guard
+becomes `completedPhases.includes(phase) && !state._needsReexecution`, which is
+enough on its own; do **not** also clear the completed flag, as a phase marker
+mutated on the rework path is a second source of truth for the same decision.
+`_needsReexecution` is `false` by
+default on every fresh invocation, so it safely distinguishes "legitimate resume
+skip" from "must re-execute for rejection rework." Prefer routing new fast-mode
+nodes through `executeNode()` instead of reimplementing this check by hand.
+
+## Real-git integration tests must isolate the host's global/system git config
+
+`tests/integration/.../merge-step-real-git/local-merge.test.ts` and
+`smoke.test.ts` asserted a freshly-`git init`'d harness repo has **no** remotes,
+but failed with `git remote` reporting `origin` — not because the harness added
+one, but because the developer/CI machine's `~/.gitconfig` had a stray
+`[remote "origin"]` section (even one with only `prune = true`, no `url`). Git
+merges system + global + local config into one view, so that phantom section
+leaked into every repo's `git remote` output, including brand-new ones.
+
+**Rule:** any test harness that shells out to the real `git`/`gh` binaries
+(`execFile` rather than a mock) must isolate `GIT_CONFIG_GLOBAL=/dev/null` and
+`GIT_CONFIG_SYSTEM=/dev/null` in the child process env. Otherwise the test's
+pass/fail outcome depends on the ambient config of whatever machine runs it —
+a correctness bug in the harness, not flakiness in the test itself. Fixed once,
+centrally, in `setup.ts`'s `makeRealExec()` so every test in the suite inherits
+the isolation.
+
+## A `try` that both calls and throws swallows its own error
+
+`PtyTerminalSessionService.create()` guarded the cwd check like this:
+
+```ts
+try {
+  const stat = statSync(input.cwd);
+  if (!stat.isDirectory()) throw new Error(`Working directory is not a directory: ${cwd}`);
+} catch (error) {
+  if (error instanceof Error && 'code' in error) { /* ENOENT / EACCES mapping */ }
+  throw new Error(`Cannot access working directory: ${cwd}`);   // <- catches its own throw
+}
+```
+
+The `isDirectory` error has no `code`, so it fell past the errno branches and was
+rewritten as the generic "Cannot access" message. The specific diagnosis was
+computed, then discarded — and a unit test asserting the precise message is the
+only thing that shows it, because both paths still throw.
+
+**Rule:** a `try` block wraps **only** the call that can fail. Validation of that
+call's *result* goes after the `catch`, never inside the `try` — otherwise the
+catch-all rethrow becomes a silent overwrite of your own error. Any `catch` that
+ends in an unconditional `throw new Error(...)` must be read as "every error
+raised above me is now this message."
+
+## Adding a method to a port interface breaks every hand-built mock
+
+Adding one method to `INodeHelpers` compiled fine in `packages/core` but broke
+six test files that build the port as an object literal
+(`{ writeSpecFileAtomic: vi.fn(), safeYamlDump: vi.fn() }`) — `TS2741`, one per
+site. Nothing in the source tree points at them, so the port change looks
+complete right up until `pnpm typecheck`.
+
+**Rule:** widening a port interface is a two-part change. After editing the
+interface, `grep` for a distinctive existing member (`grep -rn "safeYamlDump:" tests/`)
+and update every literal in the **same commit** — a port change that typechecks
+only in `packages/core` is not done. Prefer a shared mock factory over an inline
+literal for any port with more than two members, so the next method is one edit.
+
+## A watchdog test must advance past the reconnect delay, not just the timeout
+
+The SSE heartbeat tests advanced fake timers by exactly the 60s timeout and then
+asserted a replacement `EventSource` existed. It never did: the watchdog closes
+the dead stream immediately but schedules the reconnect one backoff interval
+later, and `advanceTimersByTime(60_000)` does not run a timer queued at 61_000.
+A fourth test advanced to exactly the deadline and expected "still connected",
+but `setTimeout(60_000)` fires *at* 60_000, not after.
+
+**Rule:** a timer test asserts each step of the chain separately — timeout fires
+(stream closed, status disconnected), *then* backoff elapses (replacement
+created). Mirror the delay as a named constant in the test rather than hiding it
+in an arithmetic literal, and probe a boundary from *just inside* it
+(`advanceTimersByTime(59_999)`), because `<=` is what fake timers implement.
+
+## Never trust a green claim from a branch you are porting
+
+Seven branches ported from a fork arrived with: three timer tests that could not
+pass as written, six port mocks never updated, a swallowed-error defect, and
+three `spec.yaml` files that did not parse. None of it was visible from reading
+the diffs — only `pnpm lint && pnpm typecheck && pnpm test:unit && pnpm test:int`
+on the merge result surfaced it.
+
+**Rule:** porting is authoring. Run the full local verification sequence against
+the *merged* tree, not the source branch, and fix what it finds in the porting
+commit — the moment the code lands here it is ours, and "it was like that on
+their branch" is not a status. Take the source branch's tests as a statement of
+intent to be re-verified, not as evidence.
+
+## Multi-line values written into `spec.yaml` must be block scalars
+
+Three ported specs failed `spec-yaml-backward-compatibility` because a user's
+pasted bug report (agent log lines) was written as a plain scalar: continuation
+lines sat at column 0, and YAML read `[2026-08-25T…] [fast-implement] …` as a new
+mapping key ("bad indentation of a mapping entry"). The same file also had lines
+that had fallen out of the `content: |` block.
+
+**Rule:** any spec field fed from free-form user input (`oneLiner`, `userQuery`,
+`summary`, `content`) is emitted as a literal block (`|-`) with every line
+indented — never as an inline scalar, however short it looks at write time. A
+value containing `: `, a leading `[`, or a newline breaks the document, and the
+repo-wide parse test is the only place it shows up.
+
+## An erased constructor parameter makes a tsyringe binding depend on the build
+
+`DiagnosticRunner(options: RunnerOptions = {})` took an **interface**, which
+erases to `Object`. Bound with `registerSingleton`, resolution goes through
+tsyringe's reflective construction, which needs `design:paramtypes` to have been
+emitted. Under `tsc` it resolves (tsyringe happily constructs `Object`), so every
+node test passes. Where the build does not emit decorator metadata — the
+Next/Turbopack compile of the web surface — it throws
+`TypeInfo not known for "Object"`, and the user sees
+"Environment check unavailable".
+
+**Rules:**
+
+1. **A class whose constructor parameter erases to `Object` must not be bound
+   reflectively.** Either give the parameter a real class token, or bind a
+   ready-made instance: `container.registerInstance(TOKEN, new Thing())`. The
+   instance form is the stronger fix — it is correct whether or not metadata is
+   emitted, and matches the bypass already used for
+   `GithubDiscussionRecapPublisher` in the same file.
+2. **`tsc`-based tests cannot prove this class of DI bug.** `@injectable()`
+   captures paramtypes at decoration time, so deleting the metadata afterwards in
+   a test changes nothing, and `typeInfo` is not exported from tsyringe 4.x.
+   Do not write a test that appears to guard it — verify the web build, and say
+   plainly when a fix is covered only by the symptom-level test.
+3. **A test that passes both before and after the fix is not a regression test.**
+   Run it against the old code; if it stays green, delete it rather than shipping
+   a green check that proves nothing.
 
 ## A `useEffect`-pair "hydrate then persist" localStorage hook races itself on mount
 
@@ -1962,3 +2219,78 @@ A PR check can be green or red for an old synthetic merge ref while upstream
 `main` has already advanced. Before making a release decision, compare the PR's
 `baseRefOid` with the live upstream default branch and inspect the check's
 `headSha`; stale results must be refreshed by rebasing and rerunning.
+## A Next.js server action must resolve core use cases by token, not by import
+
+The fleet web action imported `GetFleetOverviewUseCase` as a value and passed the class to
+`resolve()`. That is how the unit tests, the CLI and the DI container all do it, so it looked
+right — and every check that could run in isolation passed: `pnpm typecheck`, `pnpm lint`,
+`pnpm test:unit`, `pnpm test:int` and `pnpm build:storybook` were all green.
+
+`pnpm build:web` (`next build`) failed, and with it every E2E and Electron job in CI — ten red
+checks from one import line.
+
+The cause is specific: core's internal relative imports are `.js`-suffixed
+(`../../../domain/generated/output.js`) to suit Node ESM, and there is no `extensionAlias` for
+that here, so the moment a value import pulls a core module into the web bundle Turbopack fails
+with `Module not found`. Existing actions avoid it by importing the use case as a **type** and
+resolving it by string token — `resolve<LoadSettingsUseCase>('LoadSettingsUseCase')`. That is
+what `infrastructure/di/tokens.ts` and the generic `resolve<T>` signature are for.
+
+**Rules:**
+
+1. In `src/presentation/web`, import core as `import type` and resolve by token. A value import
+   of anything under `packages/core/src` is a build failure waiting for the next `next build`.
+2. Typecheck, lint and the unit suites cannot see this class of bug — nothing else in the
+   toolchain resolves modules the way Turbopack does. When a change makes the web app import a
+   core module for the first time, run `pnpm build:web` before pushing.
+3. A CI job that fails in about a minute on every platform is a build failure, not a test
+   failure. Read the shared step they all run first; the per-platform detail is noise.
+4. The same asymmetry bit in both directions. In one file a type-only import needed no
+   resolution while the sibling value import did, which is how a broken relative path and this
+   bundler mismatch each survived four other green gates.
+
+## A wall-clock ceiling measures the runner, not the code
+
+`daemon-lifecycle.test.ts` bounded NFR-1 ("the parent hands the daemon off and exits") with
+`expect(elapsed).toBeLessThan(isWindows ? 20000 : 10000)`. The same commit read 6s on one Windows
+run and 27.5s on the next — the runner was four times slower for a few minutes, and a test with
+nothing to do with the change went red.
+
+The property is a *delta*: everything `shep start` costs beyond an ordinary CLI invocation is the
+handoff. Measuring a plain `shep status` immediately before and asserting on the difference makes
+runner speed cancel out — and the measured delta is ~500ms (`SPAWN_SETTLE_MS` plus the
+`daemon.json` write) against a 5s budget, where the old form had 10s of pure headroom and still
+flaked.
+
+**Rules:**
+
+1. Never assert an absolute duration in an E2E test. Assert the difference against a baseline
+   measured in the same environment, moments apart, or assert on an observable fact instead.
+2. Prove the budget still bites: set it to `0`, run the test, and read the real delta out of the
+   failure message. A timing assertion nobody has watched fail is decoration.
+3. Two timeouts around the same command must not be able to tie. The runner's `execSync` kill has
+   to fire before vitest's, or the failure is a bare "test timed out" with no command output —
+   `feat.test.ts` capped the runner at 30s on a platform whose own default was already 30s, so a
+   loaded Windows runner killed `feat new` mid-worktree and reported exit code 1, indistinguishable
+   from a real failure.
+
+## A nested `eslint.config.mjs` silently drops every rule scoped by path
+
+`src/presentation/web/eslint.config.mjs` re-exported the root config, so `pnpm lint:web` looked
+correctly wired. But flat-config `files` patterns resolve against the directory of the config file
+ESLint actually loaded, so the root block scoped to `src/presentation/web/**/*.tsx` matched nothing
+when ESLint was launched from inside that directory. The React, hooks and Next plugins were
+therefore never registered for the files they exist for: `pnpm lint:web` reported 38
+`Definition for rule 'react-hooks/exhaustive-deps' was not found` errors — which is ESLint saying
+"your disable comments reference rules I never loaded", not "your code is clean". Deleting the
+nested config lets ESLint find the root one by upward search, with the repo root as the base path,
+and the rules match again.
+
+**Rules:**
+
+1. One flat config per repo. A nested config that "just extends the root" re-bases every path
+   pattern in it.
+2. `Definition for rule … was not found` is never cosmetic. It means a rule you believe is
+   enforcing something is absent — check what else that plugin was supposed to be checking.
+3. Prove a lint gate is live before trusting it: write a file that violates the rule and watch it
+   fail. Here `useEffect` with a missing dependency went from silently passing to reported.
