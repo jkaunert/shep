@@ -440,13 +440,7 @@ export class GitPrService implements IGitPrService {
         };
       }
 
-      // A missing workflow run is neutral when PR checks are also neutral
-      // (for example, a repository with no Actions and no configured checks).
-      // Preserve pending when an external PR check is still running.
-      if (
-        prCheckStatus.status === 'pending' ||
-        (workflowStatus.status === 'pending' && workflowStatus.runUrl)
-      ) {
+      if (workflowStatus.status === 'pending' || prCheckStatus.status === 'pending') {
         return { status: 'pending', runUrl: workflowStatus.runUrl };
       }
 

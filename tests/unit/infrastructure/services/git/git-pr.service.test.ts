@@ -516,14 +516,14 @@ describe('GitPrService', () => {
       expect(result.runUrl).toBe('https://github.com/org/repo/actions/runs/123');
     });
 
-    it('should return success when no workflow runs or PR checks are found', async () => {
+    it('should return pending when no workflow runs or PR checks are found', async () => {
       vi.mocked(mockExec)
         .mockResolvedValueOnce({ stdout: '[]', stderr: '' })
         .mockResolvedValueOnce({ stdout: JSON.stringify([]), stderr: '' });
 
       const result = await service.getCiStatus('/repo', 'feat/branch');
 
-      expect(result.status).toBe('success');
+      expect(result.status).toBe('pending');
     });
 
     it('should throw GitPrError when gh command fails', async () => {
@@ -691,7 +691,7 @@ describe('GitPrService', () => {
       expect(result.status).toBe('success');
     });
 
-    it('should return success when no workflow runs or PR checks are reported', async () => {
+    it('should return pending when no workflow runs or PR checks are reported', async () => {
       const noChecksError = new Error(
         'Command failed: gh pr checks feat/branch --json bucket,state,name'
       ) as Error & { code: number; stderr: string };
@@ -704,7 +704,7 @@ describe('GitPrService', () => {
 
       const result = await service.getCiStatus('/repo', 'feat/branch');
 
-      expect(result).toEqual({ status: 'success' });
+      expect(result.status).toBe('pending');
     });
 
     it('should preserve pending PR checks when no workflow runs exist', async () => {
