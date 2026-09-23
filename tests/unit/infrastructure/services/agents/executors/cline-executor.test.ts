@@ -8,12 +8,14 @@
  */
 
 import 'reflect-metadata';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { ClineExecutorService } from '@/infrastructure/services/agents/common/executors/cline-executor.service.js';
 import type { SpawnFunction } from '@/infrastructure/services/agents/common/types.js';
-import { AgentType, AgentFeature } from '@/domain/generated/output.js';
+import { AgentType, AgentFeature, SecurityMode } from '@/domain/generated/output.js';
+import { SecurityViolationError } from '@/domain/errors/security-violation.error.js';
+import { strictConstraints } from './security-constraints.fixture.js';
 
 /**
  * Creates a mock ChildProcess-like object that can emit events and provide
@@ -83,6 +85,12 @@ describe('ClineExecutorService', () => {
   beforeEach(() => {
     mockSpawn = vi.fn();
     executor = new ClineExecutorService(mockSpawn);
+  });
+
+  // A fake-timer test that fails before its own `useRealTimers()` must not
+  // leave every later test waiting on timers that never advance.
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   // --- agentType and supportsFeature ---
@@ -206,16 +214,28 @@ describe('ClineExecutorService', () => {
       expect(result.result).toBe('Final result');
     });
 
-    it('should accumulate non-JSON lines as raw text', async () => {
+    it('should not splice CLI chatter into a structured result', async () => {
       const mockProc = createMockChildProcess();
       vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
 
       const executePromise = executor.execute('Prompt', { silent: true });
-      emitJsonlLines(mockProc, ['Raw text output', sayEvent('JSON part')], null, 0);
+      emitJsonlLines(mockProc, ['Using model claude-sonnet-4-5', sayEvent('JSON part')], null, 0);
 
       const result = await executePromise;
-      expect(result.result).toContain('Raw text output');
-      expect(result.result).toContain('JSON part');
+      // The banner the CLI prints is not part of the agent's answer; splicing
+      // it in corrupts commit messages and PR bodies downstream.
+      expect(result.result).toBe('JSON part');
+    });
+
+    it('should fall back to raw stdout when no structured event carried text', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Prompt', { silent: true });
+      emitJsonlLines(mockProc, ['plain text answer'], null, 0);
+
+      const result = await executePromise;
+      expect(result.result).toBe('plain text answer');
     });
 
     // --- Model option ---
@@ -397,7 +417,7 @@ describe('ClineExecutorService', () => {
       mockProc.stderr.end();
       mockProc.emit('close', null);
 
-      await expect(executePromise).rejects.toThrow(/timed out/i);
+      await expect(executePromise).rejects.toThrow('Agent execution timed out after 5s');
       expect(mockProc.kill).toHaveBeenCalled();
       vi.useRealTimers();
     });
@@ -572,7 +592,25 @@ describe('ClineExecutorService', () => {
       }
 
       expect(events.some((e) => e.type === 'error')).toBe(true);
-      expect(events.find((e) => e.type === 'error')?.content).toBe('Internal server error');
+      // Same shape as execute(): the exit code first, stderr as the detail.
+      expect(events.find((e) => e.type === 'error')?.content).toBe(
+        'Process exited with code 1: Internal server error'
+      );
+    });
+
+    it('should yield an error event on a non-zero exit even when stderr is empty', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Prompt', { silent: true });
+      emitJsonlLines(mockProc, [], null, 2);
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events).toEqual([{ type: 'error', content: 'Process exited with code 2' }]);
     });
 
     it('should yield error event on process error', async () => {
@@ -638,5 +676,265 @@ describe('ClineExecutorService', () => {
 
       expect(events).toContainEqual({ type: 'result', content: 'Buffered' });
     });
+  });
+  // --- defects proven by audit: UTF-8, signals, policy, stream lifetime ---
+
+  describe('multi-byte output', () => {
+    it('should not corrupt a character split across two stdout chunks', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const answer = 'héllo — ✅ 日本語 🚀 done';
+      const payload = Buffer.from(`${sayEvent(answer)}\n`, 'utf8');
+      const splitAt = payload.indexOf(Buffer.from('🚀', 'utf8')) + 2;
+
+      const executePromise = executor.execute('Prompt', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(payload.subarray(0, splitAt));
+        mockProc.stdout.write(payload.subarray(splitAt));
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      const result = await executePromise;
+      expect(result.result).toBe(answer);
+    });
+  });
+
+  describe('signal termination', () => {
+    it('should reject when the CLI is killed by a signal with nothing captured', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Prompt', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+
+      await expect(executePromise).rejects.toThrow(/SIGKILL/);
+    });
+
+    // Cline's protocol has no terminal event, so a signal kill can never be
+    // told apart from a finished turn by the output — it is always a failure.
+    it('should reject naming the signal when killed after partial text', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Prompt', { silent: true });
+      process.nextTick(() => {
+        for (const line of [sayEvent('partial work')]) mockProc.stdout.write(`${line}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGTERM');
+      });
+
+      await expect(executePromise).rejects.toThrow(/SIGTERM/);
+    });
+
+    it('should stream an error, not a result, when killed after partial text', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      process.nextTick(() => {
+        for (const line of [sayEvent('partial work')]) mockProc.stdout.write(`${line}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+      const events: { type: string; content: string }[] = [];
+      for await (const event of executor.executeStream('Prompt', { silent: true })) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events.some((e) => e.type === 'error' && e.content.includes('SIGKILL'))).toBe(true);
+      expect(events.some((e) => e.type === 'result')).toBe(false);
+    });
+  });
+
+  describe('security constraints', () => {
+    it('should refuse execute() under an enforced strict sandbox', async () => {
+      await expect(
+        executor.execute('Prompt', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })
+      ).rejects.toBeInstanceOf(SecurityViolationError);
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('should refuse executeStream() under an enforced strict sandbox', async () => {
+      const iterate = async () => {
+        for await (const _event of executor.executeStream('Prompt', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })) {
+          // no events expected — validation runs before the spawn
+        }
+      };
+
+      await expect(iterate()).rejects.toBeInstanceOf(SecurityViolationError);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('should still run under an advisory strict sandbox', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Prompt', {
+        silent: true,
+        securityConstraints: strictConstraints(SecurityMode.Advisory),
+      });
+      emitJsonlLines(mockProc, [sayEvent('ok')], null, 0);
+
+      expect((await executePromise).result).toBe('ok');
+    });
+  });
+
+  describe('executeStream lifetime', () => {
+    it('should emit exactly one result event carrying the whole answer', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Prompt', { silent: true });
+
+      process.nextTick(() => {
+        mockProc.stdout.write(`${sayEvent('The fix is in foo.ts. ')}\n`);
+        mockProc.stdout.write(`${sayEvent('[checkpoint saved]')}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      const resultEvents = events.filter((e) => e.type === 'result');
+      expect(resultEvents).toHaveLength(1);
+      expect(resultEvents[0].content).toBe('The fix is in foo.ts. [checkpoint saved]');
+    });
+
+    it('should kill the child when the consumer stops iterating early', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const gen = executor.executeStream('Prompt', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(`${sayPartial('first')}\n`);
+      });
+
+      for await (const _event of gen) {
+        break;
+      }
+
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+
+    it('should time out a stream that never closes', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      for await (const event of executor.executeStream('Prompt', {
+        silent: true,
+        timeout: 20,
+      })) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events).toContainEqual({
+        type: 'error',
+        content: 'Agent execution timed out after 0.02s',
+      });
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+
+    it('should stringify a structured error payload instead of [object Object]', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Prompt', { silent: true });
+
+      process.nextTick(() => {
+        mockProc.stdout.write(
+          `${JSON.stringify({ type: 'error', message: { code: 500, detail: 'upstream boom' } })}\n`
+        );
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      const errorEvents = events.filter((e) => e.type === 'error');
+      expect(errorEvents).toHaveLength(1);
+      expect(errorEvents[0].content).not.toContain('[object Object]');
+      expect(errorEvents[0].content).toContain('upstream boom');
+    });
+  });
+});
+
+describe('ClineExecutorService — idle timeout', () => {
+  // A stalled agent (hung API connection, wedged tool) used to sit out the
+  // whole total budget — 30 minutes by default, hours for a long implement
+  // stage. `idleTimeout` ends it after that long without any output.
+  const IDLE_MESSAGE = 'Agent execution timed out: no output for 60s';
+  let mockSpawn: SpawnFunction;
+  let executor: ClineExecutorService;
+
+  beforeEach(() => {
+    mockSpawn = vi.fn();
+    executor = new ClineExecutorService(mockSpawn);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('execute(): kills an agent silent for the idle budget, naming the budget', async () => {
+    vi.useFakeTimers();
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    const outcome = executor.execute('Prompt', { silent: true, idleTimeout: 60_000 }).then(
+      () => 'resolved',
+      (error: Error) => error.message
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    proc.stderr.write('still working\n'); // any output restarts the budget
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(proc.kill).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(proc.kill).toHaveBeenCalled();
+    proc.emit('close', null, 'SIGTERM');
+
+    expect(await outcome).toBe(IDLE_MESSAGE);
+  });
+
+  it('executeStream(): ends a silent stream with an idle-timeout error event', async () => {
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    const events: { type: string; content: string }[] = [];
+    for await (const event of executor.executeStream('Prompt', {
+      silent: true,
+      idleTimeout: 20,
+    })) {
+      events.push({ type: event.type, content: event.content });
+    }
+
+    expect(events).toContainEqual({
+      type: 'error',
+      content: 'Agent execution timed out: no output for 0.02s',
+    });
+    expect(proc.kill).toHaveBeenCalled();
   });
 });

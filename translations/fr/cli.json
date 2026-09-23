@@ -119,7 +119,11 @@
       "nodeVersionLabel": "Version Node",
       "dbPathLabel": "Chemin BD",
       "logFileLabel": "Fichier journal",
-      "daemonConfigLabel": "Configuration du démon"
+      "daemonConfigLabel": "Configuration du démon",
+      "buildLabel": "Build",
+      "gitShaLabel": "SHA Git",
+      "healthLabel": "Disponibilité",
+      "osLabel": "SE"
     },
     "ui": {
       "description": "Démarrer l'interface web Shep",
@@ -385,7 +389,8 @@
         "agentResumed": "Agent de fonctionnalité repris",
         "featureLabel": "Fonctionnalité :",
         "runIdLabel": "ID d'exécution :",
-        "failedToResume": "Échec de la reprise de la fonctionnalité"
+        "failedToResume": "Échec de la reprise de la fonctionnalité",
+        "forceOption": "Reprendre même si la limite de fonctionnalités parallèles est atteinte"
       },
       "review": {
         "description": "Revue interactive d'une fonctionnalité en attente d'approbation",
@@ -815,6 +820,15 @@
           "empty": "Aucun plan d'exécution n'était en cache pour {{path}}",
           "failed": "Impossible d'effacer le plan d'exécution"
         }
+      },
+      "approve": {
+        "description": "Examiner et approuver les commandes de développement du dépôt",
+        "fingerprintOption": "Approuver uniquement cette empreinte de commandes examinée",
+        "invalid": "Aucun .shep/dev.json valide dans {{path}}",
+        "review": "Examinez ces commandes, puis relancez cette commande avec --fingerprint {{fingerprint}}. Leur approbation ne les exécute pas.",
+        "changed": "L’empreinte ne correspond pas à la configuration actuelle. Examinez-la à nouveau avant de l’approuver.",
+        "approved": "Commandes de développement approuvées. Démarrez le serveur quand vous êtes prêt.",
+        "failed": "Impossible d’approuver les commandes de développement"
       }
     },
     "agent": {
@@ -1091,6 +1105,9 @@
       "noLogFile": "Aucun fichier journal trouvé pour {{label}}",
       "expectedAt": "Attendu : {{path}}",
       "logEmpty": "Le fichier journal est vide pour {{label}}"
+    },
+    "agentGuard": {
+      "forceOption": "Exécuter même dans une exécution d'agent Shep, au risque d'arrêter l'agent qui l'exécute"
     }
   },
   "bootstrap": {

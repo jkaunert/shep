@@ -119,7 +119,11 @@
       "nodeVersionLabel": "Versão do Node",
       "dbPathLabel": "Caminho do BD",
       "logFileLabel": "Arquivo de Log",
-      "daemonConfigLabel": "Configuração do Daemon"
+      "daemonConfigLabel": "Configuração do Daemon",
+      "buildLabel": "Compilação",
+      "gitShaLabel": "SHA do Git",
+      "healthLabel": "Prontidão",
+      "osLabel": "SO"
     },
     "ui": {
       "description": "Iniciar a interface web do Shep",
@@ -385,7 +389,8 @@
         "agentResumed": "Agente do recurso retomado",
         "featureLabel": "Recurso:",
         "runIdLabel": "ID da Execução:",
-        "failedToResume": "Falha ao retomar recurso"
+        "failedToResume": "Falha ao retomar recurso",
+        "forceOption": "Retomar mesmo quando o limite de funcionalidades paralelas for atingido"
       },
       "review": {
         "description": "Revisão interativa de um recurso aguardando aprovação",
@@ -815,6 +820,15 @@
           "empty": "Nenhum plano de execução estava em cache para {{path}}",
           "failed": "Falha ao limpar o plano de execução"
         }
+      },
+      "approve": {
+        "description": "Revisar e aprovar os comandos de desenvolvimento do repositório",
+        "fingerprintOption": "Aprovar apenas esta impressão digital de comandos revisada",
+        "invalid": "Nenhum .shep/dev.json válido em {{path}}",
+        "review": "Revise estes comandos e repita o comando com --fingerprint {{fingerprint}}. A aprovação não os executa.",
+        "changed": "A impressão digital não corresponde à configuração atual. Revise novamente antes de aprovar.",
+        "approved": "Comandos de desenvolvimento aprovados. Inicie o servidor quando estiver pronto.",
+        "failed": "Não foi possível aprovar os comandos de desenvolvimento"
       }
     },
     "agent": {
@@ -1091,6 +1105,9 @@
       "noLogFile": "Nenhum arquivo de log encontrado para {{label}}",
       "expectedAt": "Esperado: {{path}}",
       "logEmpty": "O arquivo de log está vazio para {{label}}"
+    },
+    "agentGuard": {
+      "forceOption": "Executar mesmo dentro de uma execução de agente do Shep, mesmo que isso pare o agente que o executa"
     }
   },
   "bootstrap": {

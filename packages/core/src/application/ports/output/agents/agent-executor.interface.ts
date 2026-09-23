@@ -71,6 +71,14 @@ export interface AgentExecutionStreamEvent {
   content: string;
   /** When the event was emitted */
   timestamp: Date;
+  /**
+   * Session ID for resuming the conversation, when the agent reported one.
+   *
+   * `content` always carries text meant for a human or a downstream node, so an
+   * agent whose final event also identifies the session puts the identifier
+   * here — never in `content`, which callers treat as the answer.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -106,6 +114,19 @@ export interface AgentExecutionOptions {
   outputSchema?: object;
   /** Execution timeout in milliseconds */
   timeout?: number;
+  /**
+   * Fail the run when the agent produces no output for this many
+   * milliseconds. Unset means no idle guard. Executors that cannot observe
+   * output progress ignore it and rely on `timeout` alone.
+   */
+  idleTimeout?: number;
+  /**
+   * Cancel the run. The executor terminates the agent (process tree, with
+   * SIGKILL escalation for a subprocess CLI) and fails the call as aborted —
+   * for a subprocess, only once the process has closed, so awaiting the call
+   * awaits the teardown. An already-aborted signal cancels at once.
+   */
+  abortSignal?: AbortSignal;
   /** Suppress executor debug logging (e.g. for quick foreground calls) */
   silent?: boolean;
   /** When true, adds --strict-mcp-config to disable all MCP tools */

@@ -8,12 +8,14 @@
  */
 
 import 'reflect-metadata';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { GeminiCliExecutorService } from '@/infrastructure/services/agents/common/executors/gemini-cli-executor.service.js';
 import type { SpawnFunction } from '@/infrastructure/services/agents/common/types.js';
-import { AgentType, AgentFeature } from '@/domain/generated/output.js';
+import { AgentType, AgentFeature, SecurityMode } from '@/domain/generated/output.js';
+import { SecurityViolationError } from '@/domain/errors/security-violation.error.js';
+import { strictConstraints } from './security-constraints.fixture.js';
 import type { AgentConfig } from '@/domain/generated/output.js';
 
 /**
@@ -71,6 +73,12 @@ describe('GeminiCliExecutorService', () => {
   beforeEach(() => {
     mockSpawn = vi.fn();
     executor = new GeminiCliExecutorService(mockSpawn);
+  });
+
+  // A fake-timer test that fails before its own `useRealTimers()` must not
+  // leave every later test waiting on timers that never advance.
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe('agentType', () => {
@@ -403,11 +411,13 @@ describe('GeminiCliExecutorService', () => {
       await expect(executePromise).rejects.toThrow(/Failed to parse Gemini JSON output/);
     });
 
-    it('should reject when stderr contains fatal API errors despite exit code 0', async () => {
+    it('should keep the answer when a 429 was retried and the retry succeeded', async () => {
       const mockProc = createMockChildProcess();
       vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
 
-      // Gemini CLI exits 0 but stderr shows repeated 429 rate limit errors
+      // "Attempt N failed ... Retrying" is what the CLI prints when it RETRIES.
+      // A retry that then succeeds ends with exit 0 and a full response, so
+      // treating the notice itself as fatal threw away completed work.
       const stderrOutput =
         'Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: [{\n' +
         '  "error": { "code": 429, "message": "No capacity available for model gemini-3-flash-preview on the server" }\n' +
@@ -416,19 +426,31 @@ describe('GeminiCliExecutorService', () => {
       const executePromise = executor.execute('Test', { silent: true });
       emitStreamData(mockProc, jsonOutput, stderrOutput, 0);
 
-      await expect(executePromise).rejects.toThrow(/fatal error.*stderr/i);
+      expect((await executePromise).result).toBe('Some partial response');
     });
 
-    it('should reject when stderr contains RESOURCE_EXHAUSTED despite exit code 0', async () => {
+    it('should keep the answer even when stderr mentions RESOURCE_EXHAUSTED', async () => {
       const mockProc = createMockChildProcess();
       vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
 
+      // Exit 0 plus a complete response IS the agent's answer; quota noise from
+      // a call the CLI recovered from must not discard it.
       const stderrOutput = '"status": "RESOURCE_EXHAUSTED"';
       const jsonOutput = buildGeminiJsonResponse('Partial');
       const executePromise = executor.execute('Test', { silent: true });
       emitStreamData(mockProc, jsonOutput, stderrOutput, 0);
 
-      await expect(executePromise).rejects.toThrow(/fatal error.*stderr/i);
+      expect((await executePromise).result).toBe('Partial');
+    });
+
+    it('should reject with the stderr diagnosis when exit 0 produced no answer', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Test', { silent: true });
+      emitStreamData(mockProc, buildGeminiJsonResponse(''), '"status": "RESOURCE_EXHAUSTED"', 0);
+
+      await expect(executePromise).rejects.toThrow(/RESOURCE_EXHAUSTED/);
     });
 
     it('should NOT reject for non-fatal stderr messages with exit code 0', async () => {
@@ -473,7 +495,7 @@ describe('GeminiCliExecutorService', () => {
       mockProc.stderr.end();
       mockProc.emit('close', null);
 
-      await expect(executePromise).rejects.toThrow(/timed out/i);
+      await expect(executePromise).rejects.toThrow('Agent execution timed out after 5s');
       expect(mockProc.kill).toHaveBeenCalled();
       vi.useRealTimers();
     });
@@ -628,5 +650,205 @@ describe('GeminiCliExecutorService', () => {
       const spawnOpts = vi.mocked(mockSpawn).mock.calls[0][2] as Record<string, unknown>;
       expect((spawnOpts.env as Record<string, string>).GEMINI_API_KEY).toBe('stream-key-456');
     });
+  });
+  // --- defects proven by audit: UTF-8, stdin, policy, stream lifetime ---
+
+  describe('multi-byte output', () => {
+    it('should not corrupt a character split across two stdout chunks', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const answer = 'héllo — ✅ 日本語 🚀 done';
+      const payload = Buffer.from(buildGeminiJsonResponse(answer), 'utf8');
+      const splitAt = payload.indexOf(Buffer.from('🚀', 'utf8')) + 2;
+
+      const executePromise = executor.execute('Test', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(payload.subarray(0, splitAt));
+        mockProc.stdout.write(payload.subarray(splitAt));
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      expect((await executePromise).result).toBe(answer);
+    });
+  });
+
+  describe('prompt delivery', () => {
+    it('should survive an EPIPE when the CLI exits before reading the prompt', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('a large prompt', { silent: true });
+
+      // A stream 'error' with no listener reaches uncaughtException and kills
+      // the whole worker instead of failing this one run.
+      expect(() =>
+        mockProc.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+      ).not.toThrow();
+
+      emitStreamData(mockProc, null, 'agent died', 1);
+      await expect(executePromise).rejects.toThrow(/agent died/);
+    });
+  });
+
+  describe('signal termination', () => {
+    it('should name the signal when the CLI is killed with nothing on stdout', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Test', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+
+      await expect(executePromise).rejects.toThrow(/SIGKILL/);
+    });
+  });
+
+  describe('security constraints', () => {
+    it('should refuse execute() under an enforced strict sandbox', async () => {
+      await expect(
+        executor.execute('Test', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })
+      ).rejects.toBeInstanceOf(SecurityViolationError);
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('should refuse executeStream() under an enforced strict sandbox', async () => {
+      const iterate = async () => {
+        for await (const _event of executor.executeStream('Test', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })) {
+          // validation runs before the spawn
+        }
+      };
+
+      await expect(iterate()).rejects.toBeInstanceOf(SecurityViolationError);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('executeStream lifetime', () => {
+    it('should time out a stream that never closes, naming the budget', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      for await (const event of executor.executeStream('Test', { silent: true, timeout: 20 })) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events).toContainEqual({
+        type: 'error',
+        content: 'Agent execution timed out after 0.02s',
+      });
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+
+    it('should kill the child when the consumer stops iterating early', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const gen = executor.executeStream('Test', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(`${JSON.stringify({ type: 'tool_use', tool_name: 'read' })}\n`);
+      });
+
+      for await (const _event of gen) {
+        break;
+      }
+
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+
+    it('should stringify a structured error payload instead of dropping it', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Test', { silent: true });
+
+      process.nextTick(() => {
+        mockProc.stdout.write(
+          `${JSON.stringify({ type: 'error', error: { code: 500, detail: 'upstream boom' } })}\n`
+        );
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      const errorEvent = events.find((e) => e.type === 'error');
+      expect(errorEvent?.content).toContain('upstream boom');
+    });
+  });
+});
+
+describe('GeminiCliExecutorService — idle timeout', () => {
+  // A stalled agent (hung API connection, wedged tool) used to sit out the
+  // whole total budget — 30 minutes by default, hours for a long implement
+  // stage. `idleTimeout` ends it after that long without any output.
+  let mockSpawn: SpawnFunction;
+  let executor: GeminiCliExecutorService;
+
+  beforeEach(() => {
+    mockSpawn = vi.fn();
+    executor = new GeminiCliExecutorService(mockSpawn);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('execute(): arms no idle guard — its single-result json mode is silent until the end', async () => {
+    // execute() runs the CLI with `--output-format json`, which prints ONE
+    // line when the whole turn is done. Silence there is the normal shape of
+    // a healthy run, so an idle guard would kill every run longer than the
+    // budget; only the total timeout bounds it.
+    vi.useFakeTimers();
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    let settled = false;
+    const pending = executor
+      .execute('Prompt', { silent: true, idleTimeout: 60_000 })
+      .finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    expect(settled).toBe(false);
+    expect(proc.kill).not.toHaveBeenCalled();
+    proc.stdout.end();
+    proc.stderr.end();
+    proc.emit('close', 1, null);
+    await pending.catch(() => undefined);
+  });
+
+  it('executeStream(): ends a silent stream with an idle-timeout error event', async () => {
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    const events: { type: string; content: string }[] = [];
+    for await (const event of executor.executeStream('Prompt', {
+      silent: true,
+      idleTimeout: 20,
+    })) {
+      events.push({ type: event.type, content: event.content });
+    }
+
+    expect(events).toContainEqual({
+      type: 'error',
+      content: 'Agent execution timed out: no output for 0.02s',
+    });
+    expect(proc.kill).toHaveBeenCalled();
   });
 });

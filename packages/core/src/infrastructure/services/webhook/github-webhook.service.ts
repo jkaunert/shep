@@ -11,7 +11,12 @@
  * Registered events: pull_request, check_suite, check_run
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import {
+  createWebhookIdentity,
+  WEBHOOK_INSTANCE_QUERY_PARAM,
+  type WebhookInstanceIdentity,
+} from './webhook-identity.store.js';
 import type {
   IWebhookService,
   WebhookEvent,
@@ -20,6 +25,8 @@ import type {
 import type { IFeatureRepository } from '../../../application/ports/output/repositories/feature-repository.interface.js';
 import type { IGitPrService } from '../../../application/ports/output/services/git-pr-service.interface.js';
 import type { INotificationService } from '../../../application/ports/output/services/notification-service.interface.js';
+import type { ILogger } from '../../../application/ports/output/services/logger.interface.js';
+import { ConsoleLogger } from '../logging/console-logger.js';
 import { SdlcLifecycle, PrStatus, CiStatus } from '../../../domain/generated/output.js';
 import { NotificationEventType, NotificationSeverity } from '../../../domain/generated/output.js';
 import type { NotificationEvent, Feature } from '../../../domain/generated/output.js';
@@ -27,6 +34,27 @@ import type { NotificationEvent, Feature } from '../../../domain/generated/outpu
 const TAG = '[GitHubWebhook]';
 const WEBHOOK_EVENTS = ['pull_request', 'check_suite', 'check_run'] as const;
 const MAX_EVENT_HISTORY = 200;
+const WEBHOOK_PATH = '/api/webhooks/github';
+
+/** Tag a webhook URL with the owning installation's id. */
+function withInstanceTag(webhookUrl: string, instanceId: string): string {
+  const url = new URL(webhookUrl);
+  url.searchParams.set(WEBHOOK_INSTANCE_QUERY_PARAM, instanceId);
+  return url.toString();
+}
+
+/** Whether a hook URL on GitHub is a Shep webhook created by this installation. */
+function isOwnedHookUrl(hookUrl: string, instanceId: string): boolean {
+  try {
+    const url = new URL(hookUrl);
+    return (
+      url.pathname.endsWith(WEBHOOK_PATH) &&
+      url.searchParams.get(WEBHOOK_INSTANCE_QUERY_PARAM) === instanceId
+    );
+  } catch {
+    return false;
+  }
+}
 
 function normalizePath(p: string): string {
   return p.replace(/\\/g, '/');
@@ -62,21 +90,41 @@ export class GitHubWebhookService implements IWebhookService {
   private readonly gitPrService: IGitPrService;
   private readonly notificationService: INotificationService;
   private readonly execFn: ExecFunction;
+  private readonly logger: ILogger;
   private readonly registeredWebhooks: RegisteredWebhook[] = [];
   private readonly deliveryHistory: WebhookDeliveryRecord[] = [];
-  private webhookSecret: string;
+  private readonly webhookSecret: string;
+  private readonly instanceId: string;
 
   constructor(
     featureRepo: IFeatureRepository,
     gitPrService: IGitPrService,
     notificationService: INotificationService,
-    execFn: ExecFunction
+    execFn: ExecFunction,
+    /**
+     * Where this service's output goes. It runs inside the daemon and wrote
+     * straight to `console.*` with a per-line `no-console` suppression, so
+     * its output could not be levelled, filtered or redacted — and webhook
+     * URLs and repo names are exactly the sort of line that wants both.
+     * Defaults to a ConsoleLogger so existing callers are unaffected; DI
+     * passes the container's ILogger.
+     */
+    logger: ILogger = new ConsoleLogger(),
+    /**
+     * This installation's persisted secret + instance id (see
+     * webhook-identity.store). A stable secret keeps hooks created by a
+     * previous run validating; the instance id limits stale-hook cleanup to
+     * hooks this installation created. Defaults to a throwaway identity.
+     */
+    identity: WebhookInstanceIdentity = createWebhookIdentity()
   ) {
     this.featureRepo = featureRepo;
     this.gitPrService = gitPrService;
     this.notificationService = notificationService;
     this.execFn = execFn;
-    this.webhookSecret = randomBytes(32).toString('hex');
+    this.logger = logger;
+    this.webhookSecret = identity.secret;
+    this.instanceId = identity.instanceId;
   }
 
   /**
@@ -149,19 +197,17 @@ export class GitHubWebhookService implements IWebhookService {
         ],
         { cwd: webhook.repositoryPath }
       );
-      // eslint-disable-next-line no-console
-      console.log(`${TAG} Removed webhook #${webhook.webhookId} for ${webhook.repoFullName}`);
+      this.logger.info(`${TAG} Removed webhook #${webhook.webhookId} for ${webhook.repoFullName}`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      // eslint-disable-next-line no-console
-      console.warn(`${TAG} Failed to remove webhook for ${webhook.repoFullName}: ${msg}`);
+      this.logger.warn(`${TAG} Failed to remove webhook for ${webhook.repoFullName}: ${msg}`);
     }
 
     this.registeredWebhooks.splice(index, 1);
   }
 
   async registerWebhooks(publicUrl: string): Promise<void> {
-    const webhookUrl = `${publicUrl}/api/webhooks/github`;
+    const webhookUrl = `${publicUrl}${WEBHOOK_PATH}`;
 
     // Find all repos with features in Review lifecycle
     const features = await this.featureRepo.list({ lifecycle: SdlcLifecycle.Review });
@@ -176,12 +222,13 @@ export class GitHubWebhookService implements IWebhookService {
       await this.registerWebhookForRepo(repoPath, webhookUrl);
     }
 
-    // eslint-disable-next-line no-console
-    console.log(`${TAG} Registered webhooks for ${this.registeredWebhooks.length} repositories`);
+    this.logger.info(
+      `${TAG} Registered webhooks for ${this.registeredWebhooks.length} repositories`
+    );
   }
 
   async updateWebhookUrl(newUrl: string): Promise<void> {
-    const webhookUrl = `${newUrl}/api/webhooks/github`;
+    const webhookUrl = withInstanceTag(`${newUrl}${WEBHOOK_PATH}`, this.instanceId);
 
     for (const webhook of this.registeredWebhooks) {
       try {
@@ -204,12 +251,10 @@ export class GitHubWebhookService implements IWebhookService {
           { cwd: webhook.repositoryPath }
         );
 
-        // eslint-disable-next-line no-console
-        console.log(`${TAG} Updated webhook URL for ${webhook.repoFullName}`);
+        this.logger.info(`${TAG} Updated webhook URL for ${webhook.repoFullName}`);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        // eslint-disable-next-line no-console
-        console.warn(`${TAG} Failed to update webhook for ${webhook.repoFullName}: ${msg}`);
+        this.logger.warn(`${TAG} Failed to update webhook for ${webhook.repoFullName}: ${msg}`);
       }
     }
   }
@@ -230,12 +275,10 @@ export class GitHubWebhookService implements IWebhookService {
           { cwd: webhook.repositoryPath }
         );
 
-        // eslint-disable-next-line no-console
-        console.log(`${TAG} Removed webhook for ${webhook.repoFullName}`);
+        this.logger.info(`${TAG} Removed webhook for ${webhook.repoFullName}`);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        // eslint-disable-next-line no-console
-        console.warn(`${TAG} Failed to remove webhook for ${webhook.repoFullName}: ${msg}`);
+        this.logger.warn(`${TAG} Failed to remove webhook for ${webhook.repoFullName}: ${msg}`);
       }
     }
 
@@ -276,8 +319,7 @@ export class GitHubWebhookService implements IWebhookService {
 
   async handleEvent(event: WebhookEvent): Promise<void> {
     const startTime = Date.now();
-    // eslint-disable-next-line no-console
-    console.log(
+    this.logger.info(
       `${TAG} Received ${event.source}/${event.eventType} (delivery: ${event.deliveryId})`
     );
 
@@ -298,8 +340,7 @@ export class GitHubWebhookService implements IWebhookService {
         default:
           status = 'ignored';
           statusMessage = `Unhandled event type: ${event.eventType}`;
-          // eslint-disable-next-line no-console
-          console.log(`${TAG} Ignoring unhandled event type: ${event.eventType}`);
+          this.logger.info(`${TAG} Ignoring unhandled event type: ${event.eventType}`);
       }
     } catch (error) {
       status = 'error';
@@ -478,8 +519,7 @@ export class GitHubWebhookService implements IWebhookService {
       // Get the repo full name (owner/repo) from the remote URL
       const repoFullName = await this.getRepoFullName(repoPath);
       if (!repoFullName) {
-        // eslint-disable-next-line no-console
-        console.warn(`${TAG} Could not determine repo name for ${repoPath}`);
+        this.logger.warn(`${TAG} Could not determine repo name for ${repoPath}`);
         return;
       }
 
@@ -501,7 +541,7 @@ export class GitHubWebhookService implements IWebhookService {
           '-f',
           'name=web',
           '-f',
-          `config[url]=${webhookUrl}`,
+          `config[url]=${withInstanceTag(webhookUrl, this.instanceId)}`,
           '-f',
           'config[content_type]=json',
           '-f',
@@ -522,18 +562,18 @@ export class GitHubWebhookService implements IWebhookService {
         repositoryPath: repoPath,
       });
 
-      // eslint-disable-next-line no-console
-      console.log(`${TAG} Registered webhook #${webhookId} for ${repoFullName}`);
+      this.logger.info(`${TAG} Registered webhook #${webhookId} for ${repoFullName}`);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      // eslint-disable-next-line no-console
-      console.warn(`${TAG} Failed to register webhook for ${repoPath}: ${msg}`);
+      this.logger.warn(`${TAG} Failed to register webhook for ${repoPath}: ${msg}`);
     }
   }
 
   /**
-   * Remove stale webhooks from a previous session that point to our webhook path.
-   * Lists all hooks on the repo and deletes any whose URL ends with /api/webhooks/github.
+   * Remove stale webhooks a previous run of THIS installation left behind.
+   * Only hooks tagged with our instance id are deleted: another Shep
+   * installation (another machine, dev next to prod) registers hooks on the
+   * same path, and deleting those made the two delete each other forever.
    */
   private async removeStaleWebhooks(repoFullName: string, repoPath: string): Promise<void> {
     try {
@@ -549,8 +589,7 @@ export class GitHubWebhookService implements IWebhookService {
       }[];
 
       for (const hook of hooks) {
-        const hookUrl = hook.config?.url ?? '';
-        if (hookUrl.endsWith('/api/webhooks/github')) {
+        if (isOwnedHookUrl(hook.config?.url ?? '', this.instanceId)) {
           try {
             await this.execFn(
               'gh',
@@ -564,12 +603,10 @@ export class GitHubWebhookService implements IWebhookService {
               ],
               { cwd: repoPath }
             );
-            // eslint-disable-next-line no-console
-            console.log(`${TAG} Removed stale webhook #${hook.id} from ${repoFullName}`);
+            this.logger.info(`${TAG} Removed stale webhook #${hook.id} from ${repoFullName}`);
           } catch (deleteError) {
             const msg = deleteError instanceof Error ? deleteError.message : String(deleteError);
-            // eslint-disable-next-line no-console
-            console.warn(`${TAG} Failed to remove stale webhook #${hook.id}: ${msg}`);
+            this.logger.warn(`${TAG} Failed to remove stale webhook #${hook.id}: ${msg}`);
           }
         }
       }

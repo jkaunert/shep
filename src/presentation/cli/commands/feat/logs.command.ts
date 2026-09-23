@@ -12,9 +12,8 @@
  */
 
 import { Command } from 'commander';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { container } from '@/infrastructure/di/container.js';
+import { GetWorkerLogPathUseCase } from '@/application/use-cases/logs/get-worker-log-path.use-case.js';
 import { ShowFeatureUseCase } from '@/application/use-cases/features/show-feature.use-case.js';
 import { messages } from '../../ui/index.js';
 import { viewLog } from '../log-viewer.js';
@@ -27,6 +26,14 @@ export function createLogsCommand(): Command {
     .argument('<id>', t('cli:commands.feat.logs.idArgument'))
     .option('-f, --follow', t('cli:commands.feat.logs.followOption'))
     .option('-n, --lines <count>', t('cli:commands.feat.logs.linesOption'), '0')
+    .addHelpText(
+      'after',
+      `
+Examples:
+  $ shep feat logs abc12345
+  $ shep feat logs -f abc12345
+  $ shep feat logs -n 50 abc12345`
+    )
     .action(async (id: string, opts: { follow?: boolean; lines: string }) => {
       try {
         const useCase = container.resolve(ShowFeatureUseCase);
@@ -38,7 +45,7 @@ export function createLogsCommand(): Command {
           return;
         }
 
-        const logPath = join(homedir(), '.shep', 'logs', `worker-${feature.agentRunId}.log`);
+        const logPath = container.resolve(GetWorkerLogPathUseCase).execute(feature.agentRunId);
         const ok = await viewLog({
           logPath,
           follow: opts.follow,

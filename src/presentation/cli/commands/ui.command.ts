@@ -19,6 +19,7 @@ import { Command, InvalidArgumentError } from 'commander';
 import { findAvailablePort, DEFAULT_PORT } from '@/infrastructure/services/port.service.js';
 import { container } from '@/infrastructure/di/container.js';
 import type { IVersionService } from '@/application/ports/output/services/version-service.interface.js';
+import type { ILogger } from '@/application/ports/output/services/logger.interface.js';
 import type { IWebServerService } from '@/application/ports/output/services/web-server-service.interface.js';
 import type { IAgentRunRepository } from '@/application/ports/output/agents/agent-run-repository.interface.js';
 import type { IPhaseTimingRepository } from '@/application/ports/output/agents/phase-timing-repository.interface.js';
@@ -48,6 +49,8 @@ import {
   initializeMonthlyRecapWatcher,
   getMonthlyRecapWatcher,
 } from '@/infrastructure/services/contributors/monthly-recap-watcher.service.js';
+import { RetentionScheduler } from '@/infrastructure/services/maintenance/retention-scheduler.js';
+import { PruneRetainedDataUseCase } from '@/application/use-cases/maintenance/prune-retained-data.use-case.js';
 import { DetectStaleGoodFirstIssueUseCase } from '@/application/use-cases/contributors/detect-stale-good-first-issue.use-case.js';
 import { GenerateMonthlyRecapUseCase } from '@/application/use-cases/contributors/generate-monthly-recap.use-case.js';
 import { PublishMonthlyRecapUseCase } from '@/application/use-cases/contributors/publish-monthly-recap.use-case.js';
@@ -130,9 +133,18 @@ Examples:
           notificationService,
           undefined,
           db,
-          gitForkService
+          gitForkService,
+          container.resolve<ILogger>('ILogger')
         );
         getPrSyncWatcher().start();
+
+        // Re-run data retention while this long-lived process is up: it
+        // otherwise runs only at process start (spec 116).
+        const retentionScheduler = new RetentionScheduler(
+          () => container.resolve(PruneRetainedDataUseCase).execute(),
+          (error) => process.stderr.write(`[ui] data retention prune failed: ${String(error)}\n`)
+        );
+        retentionScheduler.start();
 
         // Start auto-archive watcher for completed features
         initializeAutoArchiveWatcher(featureRepo);
@@ -170,7 +182,11 @@ Examples:
           const tunnelService = container.resolve<ITunnelService>('ITunnelService');
           const webhookService =
             container.resolve<IGitHubWebhookServiceType>('IGitHubWebhookService');
-          initializeWebhookManager(tunnelService, webhookService);
+          initializeWebhookManager(
+            tunnelService,
+            webhookService,
+            container.resolve<ILogger>('ILogger')
+          );
           // Start is async and non-blocking — failures are logged, not thrown
           void getWebhookManager().start(port);
         } catch {
@@ -207,6 +223,7 @@ Examples:
           getPrSyncWatcher().stop();
           getNotificationWatcher().stop();
           getAutoArchiveWatcher().stop();
+          retentionScheduler.stop();
           getStaleGoodFirstIssueWatcher().stop();
           getMonthlyRecapWatcher().stop();
           void whatsappService.stop();

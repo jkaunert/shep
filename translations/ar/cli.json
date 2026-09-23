@@ -119,7 +119,11 @@
       "nodeVersionLabel": "إصدار Node",
       "dbPathLabel": "مسار قاعدة البيانات",
       "logFileLabel": "ملف السجل",
-      "daemonConfigLabel": "تكوين الخدمة الخلفية"
+      "daemonConfigLabel": "تكوين الخدمة الخلفية",
+      "buildLabel": "الإصدار",
+      "gitShaLabel": "Git SHA",
+      "healthLabel": "الجاهزية",
+      "osLabel": "نظام التشغيل"
     },
     "ui": {
       "description": "بدء واجهة Shep الويب",
@@ -385,7 +389,8 @@
         "agentResumed": "تم استئناف وكيل الميزة",
         "featureLabel": "الميزة:",
         "runIdLabel": "معرّف التشغيل:",
-        "failedToResume": "فشل استئناف الميزة"
+        "failedToResume": "فشل استئناف الميزة",
+        "forceOption": "استئناف حتى عند بلوغ حد الميزات المتوازية"
       },
       "review": {
         "description": "مراجعة تفاعلية لميزة في انتظار الموافقة",
@@ -815,6 +820,15 @@
           "empty": "لم تكن هناك خطة تشغيل مخزَّنة لـ {{path}}",
           "failed": "فشل مسح خطة التشغيل"
         }
+      },
+      "approve": {
+        "description": "مراجعة أوامر التطوير للمستودع والموافقة عليها",
+        "fingerprintOption": "الموافقة على بصمة الأوامر التي تمت مراجعتها فقط",
+        "invalid": "لا يوجد ملف .shep/dev.json صالح في {{path}}",
+        "review": "راجع هذه الأوامر، ثم أعد الأمر مع --fingerprint {{fingerprint}}. الموافقة لا تنفذ الأوامر.",
+        "changed": "البصمة لا تطابق الإعدادات الحالية. راجعها مجددًا قبل الموافقة.",
+        "approved": "تمت الموافقة على أوامر التطوير. شغّل خادم التطوير عندما تكون جاهزًا.",
+        "failed": "تعذرت الموافقة على أوامر التطوير"
       }
     },
     "agent": {
@@ -1091,6 +1105,9 @@
       "noLogFile": "لم يتم العثور على ملف سجل لـ {{label}}",
       "expectedAt": "المتوقع: {{path}}",
       "logEmpty": "ملف السجل فارغ لـ {{label}}"
+    },
+    "agentGuard": {
+      "forceOption": "التشغيل حتى داخل تشغيل وكيل Shep، رغم أن ذلك سيوقف الوكيل الذي يشغّله"
     }
   },
   "bootstrap": {

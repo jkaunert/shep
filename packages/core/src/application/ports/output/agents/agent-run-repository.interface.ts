@@ -25,6 +25,48 @@ export interface AgentRunPinnedConfigUpdate {
  * - Provide thread-safe operations
  * - Support query by thread ID and PID for crash recovery
  */
+/**
+ * Conditions a status transition must satisfy at the moment of the write.
+ *
+ * A transition decided from an earlier read is a race: the daemon's crash
+ * sweep reads `running`, asks the OS whether the PID is alive, and by then the
+ * worker has written `completed` and exited — the normal path. Without a guard
+ * the sweep overwrites a successful run with "crashed".
+ *
+ * Deliberately opt-in rather than a blanket "never leave a terminal status".
+ * Resuming an interrupted run is a legitimate terminal-to-running transition
+ * (ResumeFeatureUseCase, and approve/reject of a waiting run), and a default
+ * guard would refuse it while a live agent kept working.
+ */
+export interface AgentRunStatusUpdateOptions {
+  /** Apply the update only while the run is in one of these statuses. */
+  allowedFrom?: readonly AgentRunStatus[];
+  /**
+   * Apply the update only while the row's `updatedAt` is still exactly this
+   * value — i.e. nothing has written the run since the caller read it. For a
+   * writer that judged the run from its fields (a stale heartbeat, a dead pid
+   * past a grace period): a heartbeat or a new worker's claim that lands in
+   * between refreshes `updatedAt`, and the write then refuses.
+   */
+  expectedUpdatedAt?: AgentRun['updatedAt'];
+}
+
+/**
+ * Fields a status transition may write alongside the status.
+ *
+ * `pid` additionally accepts `null` to clear a previous worker's PID in the
+ * same statement as the transition — a resume that claims a waiting run must
+ * not leave the dead worker's PID where Stop would signal it. `undefined`
+ * leaves any field unchanged.
+ */
+export type AgentRunStatusUpdates = Omit<Partial<AgentRun>, 'pid'> & { pid?: number | null };
+
+/** Narrows `list()`; an omitted field does not filter. */
+export interface AgentRunListFilter {
+  /** Only runs currently in one of these statuses. */
+  statuses?: readonly AgentRunStatus[];
+}
+
 export interface IAgentRunRepository {
   /**
    * Create a new agent run record.
@@ -76,8 +118,16 @@ export interface IAgentRunRepository {
    * @param id - The agent run ID
    * @param status - The new status
    * @param updates - Optional additional fields to update
+   * @param options - Optional state guard; see {@link AgentRunStatusUpdateOptions}
+   * @returns True when a row was actually updated. A guarded write that lost
+   *   the race returns false instead of silently doing nothing.
    */
-  updateStatus(id: string, status: AgentRunStatus, updates?: Partial<AgentRun>): Promise<void>;
+  updateStatus(
+    id: string,
+    status: AgentRunStatus,
+    updates?: AgentRunStatusUpdates,
+    options?: AgentRunStatusUpdateOptions
+  ): Promise<boolean>;
 
   /**
    * Update the pinned executor config for an existing run.
@@ -97,11 +147,16 @@ export interface IAgentRunRepository {
   findRunningByPid(pid: number): Promise<AgentRun[]>;
 
   /**
-   * List all agent runs.
+   * List agent runs — all of them, or those matching `filter`.
    *
-   * @returns Array of all agent runs
+   * Pollers should filter: listing (and mapping) every run ever recorded on
+   * each tick grows without bound. `statuses` is served by
+   * `idx_agent_runs_status_completed`.
+   *
+   * @param filter - Optional narrowing; omitted means every run
+   * @returns Array of matching agent runs
    */
-  list(): Promise<AgentRun[]>;
+  list(filter?: AgentRunListFilter): Promise<AgentRun[]>;
 
   /**
    * Delete an agent run by ID.

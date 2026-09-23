@@ -122,6 +122,18 @@ describe('FeatureAgentProcessService', () => {
       expect(options.stdio).toEqual(expect.arrayContaining(['ignore', 'ipc']));
     });
 
+    // Every agent CLI the worker spawns inherits this, so a `shep` command an
+    // agent runs can tell it is inside a run and refuse to stop its own host.
+    it('marks the worker environment with its run and feature', () => {
+      service.spawn('feat-1', 'run-1', '/repo', '/repo/specs/001');
+
+      const options = mockFork.mock.calls[0][2];
+      expect(options.env).toMatchObject({
+        SHEP_AGENT_RUN_ID: 'run-1',
+        SHEP_FEATURE_ID: 'feat-1',
+      });
+    });
+
     it('should disconnect IPC and unref to allow parent to exit independently', () => {
       service.spawn('feat-1', 'run-1', '/repo', '/repo/specs/001');
 
@@ -223,6 +235,12 @@ describe('FeatureAgentProcessService', () => {
         AgentRunStatus.interrupted,
         expect.objectContaining({
           error: expect.stringContaining('crashed'),
+        }),
+        // The write is state-guarded: the worker's normal exit writes
+        // `completed` inside the window between the read above and isAlive(),
+        // and an unguarded write would report that success as a crash.
+        expect.objectContaining({
+          allowedFrom: expect.not.arrayContaining([AgentRunStatus.completed]),
         })
       );
     });

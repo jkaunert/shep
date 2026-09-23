@@ -32,7 +32,7 @@ import type {
   SupervisorEvaluateInput,
 } from '../../../../application/ports/output/agents/supervisor-agent.interface.js';
 import { SUPERVISOR_EVALUATOR_SOFT_TIMEOUT_MS } from '../../../../application/ports/output/agents/supervisor-agent.interface.js';
-import { SupervisorVerdict, type SupervisorPolicy } from '../../../../domain/generated/output.js';
+import { type SupervisorPolicy } from '../../../../domain/generated/output.js';
 import {
   buildEvaluatorPrompt,
   resolveEvaluatorModelId,
@@ -40,6 +40,8 @@ import {
   SUPERVISOR_EVALUATOR_SYSTEM_HEADER,
   SUPERVISOR_TIMEOUT_DECISION,
 } from './evaluator-prompt.js';
+import { parseEvaluatorResponse } from './verdict-parser.js';
+import { isAgentTimeoutError } from '../common/executors/process-stream.js';
 
 /** Stable slot key for the supervisor evaluator system header. */
 const EVALUATOR_PROMPT_SLOT = {
@@ -103,34 +105,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-/**
- * Try to extract a structured verdict + rationale from the executor's
- * raw response. The executor returns free-form text; we look for an
- * explicit "verdict: <value>" line and fall back to `advise` if the
- * model failed to comply.
- */
-function parseEvaluatorResponse(raw: string): { verdict: SupervisorVerdict; rationale: string } {
-  const verdicts: SupervisorVerdict[] = [
-    SupervisorVerdict.approve,
-    SupervisorVerdict.reject,
-    SupervisorVerdict.escalate,
-    SupervisorVerdict.advise,
-  ];
-  const lower = raw.toLowerCase();
-  let parsed: SupervisorVerdict = SupervisorVerdict.advise;
-  for (const candidate of verdicts) {
-    if (lower.includes(`verdict: ${candidate}`) || lower.includes(`verdict:${candidate}`)) {
-      parsed = candidate;
-      break;
-    }
-  }
-  const rationale = raw.trim().slice(0, 4000);
-  return {
-    verdict: parsed,
-    rationale: rationale.length > 0 ? rationale : 'no rationale supplied',
-  };
-}
-
 function ingestEventNode(
   deps: SupervisorGraphDeps
 ): (state: SupervisorGraphState) => Promise<Partial<SupervisorGraphState>> {
@@ -162,9 +136,12 @@ function evaluateNode(
 
     try {
       const response = await withTimeout(
+        // The race only stops WAITING; passing the budget down makes the
+        // executor kill the evaluator process instead of orphaning it.
         deps.executor.execute(state.prompt, {
           model: policy.modelId,
           silent: true,
+          timeout: timeoutMs,
         }),
         timeoutMs
       );
@@ -177,7 +154,9 @@ function evaluateNode(
       };
       return { decision };
     } catch (err) {
-      if (err instanceof SupervisorEvaluatorTimeoutError) {
+      // Whichever timer fires first — the race's or the executor's own — it is
+      // the same timeout and takes the same fail-safe path.
+      if (err instanceof SupervisorEvaluatorTimeoutError || isAgentTimeoutError(err)) {
         const decision: SupervisorDecisionResult = {
           verdict: SUPERVISOR_TIMEOUT_DECISION.verdict,
           rationale: SUPERVISOR_TIMEOUT_DECISION.rationale,

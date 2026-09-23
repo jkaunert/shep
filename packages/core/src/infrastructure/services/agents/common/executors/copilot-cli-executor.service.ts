@@ -27,14 +27,55 @@ import type {
   AgentExecutionStreamEvent,
 } from '../../../../../application/ports/output/agents/agent-executor.interface.js';
 import type { SpawnFunction } from '../types.js';
-import { getCurrentPhase, getLogPrefix } from '../../feature-agent/log-context.js';
 import { randomUUID } from 'node:crypto';
 import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { EventChannel } from '../../streaming/event-channel.js';
+import { createExecutorLogger, type ExecutorLogger } from './executor-logger.js';
+import {
+  agentTimeoutMessage,
+  buildSpawnOptions,
+  classifySpawnError,
+  createLineAccumulator,
+  createStderrTail,
+  missingTerminalEventMessage,
+  signalTerminationMessage,
+  terminateWithEscalation,
+  watchProcessIdle,
+  AGENT_ABORTED_MESSAGE,
+  watchAbortSignal,
+} from './process-stream.js';
+import {
+  validateSecurityConstraints,
+  type ExecutorCapabilities,
+} from './security-constraint-validator.js';
+
+/** Binary name on PATH. */
+const COPILOT_BINARY = 'copilot';
+
+/** Shown when the binary is missing, so the user knows how to fix it. */
+const COPILOT_NOT_FOUND_MESSAGE =
+  'GitHub Copilot CLI ("copilot") not found. ' +
+  'Install via: npm install -g @githubnext/github-copilot-cli, ' +
+  'then authenticate with: copilot auth login';
+
+/** Shown when token auth is configured, which Copilot cannot use. */
+const TOKEN_AUTH_UNSUPPORTED_MESSAGE =
+  'GitHub Copilot CLI does not support token-based authentication. ' +
+  'Auth is managed via GitHub OAuth. Run: copilot auth login';
 
 /** Features supported by Copilot CLI */
 const SUPPORTED_FEATURES = new Set<string>(['session-resume', 'streaming']);
+
+/** Copilot JSONL event types. */
+const EVENT_TYPE_MESSAGE_DELTA = 'assistant.message_delta';
+const EVENT_TYPE_MESSAGE = 'assistant.message';
+const EVENT_TYPE_RESULT = 'result';
+const EVENT_TYPE_ERROR = 'error';
+
+/** Copilot exited 0 without the event that ends every turn. */
+const TURN_NOT_COMPLETED_MESSAGE = missingTerminalEventMessage('Copilot CLI', EVENT_TYPE_RESULT);
 
 /**
  * Base flags always passed to the copilot CLI for non-interactive headless operation.
@@ -76,8 +117,8 @@ const LEGACY_MODEL_ALIASES: Record<string, string> = {
   'claude-haiku-4-5': 'claude-haiku-4.5',
   'gpt-4-1': 'gpt-4.1',
   'gpt-5-2': 'gpt-5.2',
-  'gpt-5-2-codex': 'gpt-5.2-codex',
   'gpt-5-3-codex': 'gpt-5.3-codex',
+  'gpt-5-2-codex': 'gpt-5.2-codex',
   'gpt-5-4': 'gpt-5.4',
   'gpt-5-4-mini': 'gpt-5.4-mini',
 };
@@ -89,162 +130,224 @@ interface PreparedPrompt {
 }
 
 /**
+ * Flatten Copilot message content into plain text.
+ *
+ * `content` is a string on the simple path and an array of typed blocks when
+ * the model emits structured output. Concatenating the raw value turned a
+ * structured answer into "[object Object]" — a result that parses, stores and
+ * reaches a PR body without anything noticing.
+ */
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block: { type?: string; text?: unknown }) => {
+        if (typeof block === 'string') return block;
+        if (block?.type === undefined || block.type === 'text') return asText(block?.text);
+        return '';
+      })
+      .join('');
+  }
+  if (content && typeof content === 'object') {
+    const block = content as { text?: unknown };
+    if (block.text !== undefined) return asText(block.text);
+  }
+  return asText(content);
+}
+
+/** Render a value that should have been text but may be a structured payload. */
+function asText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  return JSON.stringify(value);
+}
+
+/** Parse one JSONL line, or null when the line is not JSON at all. */
+function parseJsonLine(line: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    if (parsed === null || typeof parsed !== 'object') return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Executor service for GitHub Copilot CLI agent.
  * Uses subprocess spawning to interact with the `copilot` CLI.
  */
 export class CopilotCliExecutorService implements IAgentExecutor {
   readonly agentType: AgentType = 'copilot-cli' as AgentType;
 
-  /** When true, suppresses debug logging (set per-call via options.silent) */
-  private silent = false;
-
   constructor(
     private readonly spawn: SpawnFunction,
     private readonly authConfig?: AgentConfig
   ) {}
 
-  /** Debug logging — writes to stdout so it appears in the worker log file */
-  private log(message: string): void {
-    if (this.silent) return;
-    const ts = new Date().toISOString();
-    process.stdout.write(`[${ts}] ${getCurrentPhase()}${getLogPrefix()}${message}\n`);
-  }
+  /** Executor capabilities for security constraint validation */
+  private static readonly CAPABILITIES: ExecutorCapabilities = {
+    requiresPermissiveMode: true, // uses --allow-all (bypasses tool permission prompts)
+    executorName: 'copilot-cli',
+  };
 
   supportsFeature(feature: AgentFeature): boolean {
     return SUPPORTED_FEATURES.has(feature as string);
   }
 
   async execute(prompt: string, options?: AgentExecutionOptions): Promise<AgentExecutionResult> {
-    this.silent = options?.silent ?? false;
+    const log = this.startRun(options);
 
     // Copilot CLI is OAuth-only. Surface a clear error if token auth is attempted.
     if (this.authConfig?.authMethod === 'token') {
-      throw new Error(
-        'GitHub Copilot CLI does not support token-based authentication. ' +
-          'Auth is managed via GitHub OAuth. Run: copilot auth login'
-      );
+      throw new Error(TOKEN_AUTH_UNSUPPORTED_MESSAGE);
     }
 
     let preparedPrompt = this.prepareDirectPrompt(prompt);
     if (this.shouldUsePromptFile(prompt)) {
       preparedPrompt = await this.preparePromptFileIndirection(prompt);
     }
-    const args = this.buildArgs(preparedPrompt.promptArg, options);
-    const spawnOpts = this.buildSpawnOptions(options);
+    const args = this.buildArgs(preparedPrompt.promptArg, options, log);
+    const spawnOpts = buildSpawnOptions({ cwd: options?.cwd });
 
-    this.log(
-      `Spawning: copilot ${args.map((a) => (a.length > 80 ? `${a.slice(0, 77)}...` : a)).join(' ')}`
+    log(
+      `Spawning: ${COPILOT_BINARY} ${args.map((a) => (a.length > 80 ? `${a.slice(0, 77)}...` : a)).join(' ')}`
     );
-    this.log(`Spawn cwd: ${(spawnOpts.cwd as string) ?? '(inherited)'}`);
+    log(`Spawn cwd: ${(spawnOpts.cwd as string) ?? '(inherited)'}`);
 
     let proc: ReturnType<SpawnFunction>;
     try {
-      proc = this.spawn('copilot', args, spawnOpts);
+      proc = this.spawn(COPILOT_BINARY, args, spawnOpts);
     } catch (error) {
       await preparedPrompt.cleanup();
       throw error;
     }
-    this.log(`Subprocess PID: ${proc.pid ?? 'undefined (spawn may have failed)'}`);
-    this.log(
+    log(`Subprocess PID: ${proc.pid ?? 'undefined (spawn may have failed)'}`);
+    log(
       `Prompt length: ${prompt.length} chars (${preparedPrompt.usedFileIndirection ? 'delivered via temp prompt file indirection' : 'delivered via -p flag'})`
     );
 
     const executionPromise = new Promise<AgentExecutionResult>((resolve, reject) => {
-      let lineBuffer = '';
-      let stderr = '';
-      let timedOut = false;
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-      // State accumulated from JSONL events
+      const stderr = createStderrTail();
       let resultText = '';
       let sessionId: string | undefined;
       let usage: AgentExecutionUsage | undefined;
+      /** True once Copilot emitted its terminal `result` event. */
+      let resultSeen = false;
+      /** Set when the budget elapsed — the run's outcome, whatever follows. */
+      let timeoutError: string | undefined;
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      let cancelEscalation: (() => void) | undefined;
 
-      if (options?.timeout) {
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          proc.kill();
-        }, options.timeout);
-      }
-
-      const processLine = (line: string) => {
-        try {
-          const parsed = JSON.parse(line) as Record<string, unknown>;
-          const type = parsed.type as string;
-
-          if (type === 'assistant.message' && parsed.content) {
-            resultText += parsed.content as string;
-          } else if (type === 'result') {
-            if (parsed.sessionId) sessionId = parsed.sessionId as string;
-            if (parsed.usage) usage = this.extractUsage(parsed.usage as Record<string, unknown>);
-          }
-        } catch {
-          // Malformed JSON line — skip gracefully
-        }
+      const settle = (outcome: () => void): void => {
+        if (settled) return;
+        settled = true;
+        abortWatch.stop();
+        if (timeoutId) clearTimeout(timeoutId);
+        cancelEscalation?.();
+        outcome();
       };
 
-      proc.stdout?.on('data', (chunk: Buffer | string) => {
-        lineBuffer += chunk.toString();
-        const lines = lineBuffer.split('\n');
-        lineBuffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) processLine(trimmed);
-        }
+      /** Out of budget (total or idle): kill, and let 'close' report it. */
+      const expire = (message: string): void => {
+        if (timeoutError) return;
+        timeoutError = message;
+        log(`${message} — terminating agent`);
+        cancelEscalation = terminateWithEscalation(proc);
+      };
+
+      const timeoutMs = options?.timeout;
+      if (timeoutMs) {
+        timeoutId = setTimeout(() => expire(agentTimeoutMessage(timeoutMs)), timeoutMs);
+      }
+      watchProcessIdle(proc, options?.idleTimeout, (message) => {
+        if (!resultSeen) expire(message);
+      });
+      // The caller's cancel: like a timeout, 'close' reports it, so awaiting
+      // this call awaits the teardown.
+      const abortWatch = watchAbortSignal(proc, options?.abortSignal, {
+        onAbort: () => expire(AGENT_ABORTED_MESSAGE),
+        onUnreaped: () => settle(() => reject(new Error(AGENT_ABORTED_MESSAGE))),
       });
 
+      const accumulator = createLineAccumulator(
+        (line) => {
+          const parsed = parseJsonLine(line);
+          if (!parsed) return; // Malformed JSON line — skip gracefully
+
+          if (parsed.type === EVENT_TYPE_MESSAGE && parsed.content) {
+            resultText += contentToText(parsed.content);
+          } else if (parsed.type === EVENT_TYPE_RESULT) {
+            resultSeen = true;
+            if (typeof parsed.sessionId === 'string') sessionId = parsed.sessionId;
+            if (parsed.usage) usage = extractUsage(parsed.usage as Record<string, unknown>);
+          }
+        },
+        {
+          onOverflow: (dropped) => log(`[warn] discarded ${dropped} bytes of un-terminated output`),
+        }
+      );
+
+      proc.stdout?.on('data', (chunk: Buffer | string) => accumulator.push(chunk));
+
       proc.stderr?.on('data', (chunk: Buffer | string) => {
-        const data = chunk.toString();
-        stderr += data;
-        this.log(`stderr: ${data.trimEnd()}`);
+        stderr.push(chunk);
+        log(`stderr: ${chunk.toString().trimEnd()}`);
       });
 
       proc.on('error', (error: Error & { code?: string }) => {
-        this.log(`Process error event: ${error.message}`);
-        if (timeoutId) clearTimeout(timeoutId);
-        if (error.code === 'ENOENT') {
-          reject(
-            new Error(
-              'GitHub Copilot CLI ("copilot") not found. ' +
-                'Install via: npm install -g @githubnext/github-copilot-cli, ' +
-                'then authenticate with: copilot auth login'
-            )
-          );
-        } else {
-          reject(error);
-        }
+        log(`Process error event: ${error.message}`);
+        settle(() => reject(classifySpawnError(error, COPILOT_NOT_FOUND_MESSAGE)));
       });
 
-      proc.on('close', (code: number | null) => {
-        // Flush remaining line buffer
-        if (lineBuffer.trim()) processLine(lineBuffer.trim());
+      proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+        accumulator.flush();
+        log(`Process closed with code ${code}, result=${resultText.length} chars`);
 
-        this.log(`Process closed with code ${code}, result=${resultText.length} chars`);
-        if (timeoutId) clearTimeout(timeoutId);
-
-        if (timedOut) {
-          reject(new Error('Agent execution timed out'));
-          return;
-        }
-
-        if (code !== 0 && code !== null) {
-          // Check for auth-specific error patterns to provide actionable guidance
-          const authError = this.detectAuthError(stderr);
-          if (authError) {
-            reject(new Error(authError));
+        settle(() => {
+          if (timeoutError) {
+            reject(new Error(timeoutError));
             return;
           }
-          const message = stderr.trim()
-            ? `Process exited with code ${code}: ${stderr.trim()}`
-            : `Process exited with code ${code}`;
-          reject(new Error(message));
-          return;
-        }
 
-        const result: AgentExecutionResult = { result: resultText };
-        if (sessionId) result.sessionId = sessionId;
-        if (usage) result.usage = usage;
-        resolve(result);
+          if (code !== 0 && code !== null) {
+            // Check for auth-specific error patterns to provide actionable guidance
+            const authError = detectAuthError(stderr.text());
+            if (authError) {
+              reject(new Error(authError));
+              return;
+            }
+            const detail = stderr.text().trim();
+            reject(
+              new Error(
+                detail
+                  ? `Process exited with code ${code}: ${detail}`
+                  : `Process exited with code ${code}`
+              )
+            );
+            return;
+          }
+
+          // A signal kill (OOM killer, external kill) before the terminal
+          // `result` event cut the turn short, however much text had arrived.
+          if (code === null && !resultSeen) {
+            reject(new Error(signalTerminationMessage(signal, stderr.text())));
+            return;
+          }
+
+          // Exit 0 without the `result` event means stdout was cut short: the
+          // captured text is a fragment, however complete it reads.
+          if (!resultSeen) {
+            reject(new Error(TURN_NOT_COMPLETED_MESSAGE));
+            return;
+          }
+
+          const result: AgentExecutionResult = { result: resultText };
+          if (sessionId) result.sessionId = sessionId;
+          if (usage) result.usage = usage;
+          resolve(result);
+        });
       });
     });
 
@@ -257,15 +360,13 @@ export class CopilotCliExecutorService implements IAgentExecutor {
     prompt: string,
     options?: AgentExecutionOptions
   ): AsyncIterable<AgentExecutionStreamEvent> {
-    this.silent = options?.silent ?? false;
+    const log = this.startRun(options);
 
     // Copilot CLI is OAuth-only. Surface a clear error if token auth is attempted.
     if (this.authConfig?.authMethod === 'token') {
       yield {
         type: 'error',
-        content:
-          'GitHub Copilot CLI does not support token-based authentication. ' +
-          'Auth is managed via GitHub OAuth. Run: copilot auth login',
+        content: TOKEN_AUTH_UNSUPPORTED_MESSAGE,
         timestamp: new Date(),
       };
       return;
@@ -275,11 +376,11 @@ export class CopilotCliExecutorService implements IAgentExecutor {
     if (this.shouldUsePromptFile(prompt)) {
       preparedPrompt = await this.preparePromptFileIndirection(prompt);
     }
-    const args = this.buildArgs(preparedPrompt.promptArg, options);
-    const spawnOpts = this.buildSpawnOptions(options);
+    const args = this.buildArgs(preparedPrompt.promptArg, options, log);
+    const spawnOpts = buildSpawnOptions({ cwd: options?.cwd });
     let proc: ReturnType<SpawnFunction>;
     try {
-      proc = this.spawn('copilot', args, spawnOpts);
+      proc = this.spawn(COPILOT_BINARY, args, spawnOpts);
     } catch (error) {
       await preparedPrompt.cleanup();
       yield {
@@ -290,171 +391,182 @@ export class CopilotCliExecutorService implements IAgentExecutor {
       return;
     }
 
-    let lineBuffer = '';
-    let stderr = '';
+    const channel = new EventChannel<AgentExecutionStreamEvent>();
+    const stderr = createStderrTail();
+    /** Accumulated final response text (from assistant.message events) */
+    let resultText = '';
+    /** True once Copilot emitted its terminal `result` event. */
+    let resultSeen = false;
+    let processClosed = false;
     let timedOut = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-    // Accumulated final response text (from assistant.message events)
-    let resultText = '';
-
-    const queue: (AgentExecutionStreamEvent | null)[] = [];
-    let resolveWait: (() => void) | null = null;
-    let spawnError: Error | null = null;
-
-    function enqueue(event: AgentExecutionStreamEvent | null) {
-      queue.push(event);
-      if (resolveWait) {
-        resolveWait();
-        resolveWait = null;
-      }
-    }
-
-    function waitForItem(): Promise<void> {
-      if (queue.length > 0) return Promise.resolve();
-      return new Promise<void>((r) => {
-        resolveWait = r;
-      });
-    }
-
-    if (options?.timeout) {
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        proc.kill();
-        enqueue({ type: 'error', content: 'Agent execution timed out', timestamp: new Date() });
-        enqueue(null);
-      }, options.timeout);
-    }
-
-    const processStreamLine = (line: string) => {
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        const type = parsed.type as string;
-
-        if (type === 'assistant.message_delta' && parsed.delta) {
-          enqueue({
-            type: 'progress',
-            content: parsed.delta as string,
-            timestamp: new Date(),
-          });
-          return;
-        }
-
-        if (type === 'assistant.message' && parsed.content) {
-          // Accumulate final text; streaming progress already yielded via deltas
-          resultText += parsed.content as string;
-          return;
-        }
-
-        if (type === 'result') {
-          // Final event — yield result with accumulated text
-          enqueue({
-            type: 'result',
-            content: resultText,
-            timestamp: new Date(),
-          });
-          return;
-        }
-
-        if (type === 'error') {
-          enqueue({
-            type: 'error',
-            content: (parsed.message as string) ?? (parsed.content as string) ?? 'Unknown error',
-            timestamp: new Date(),
-          });
-          return;
-        }
-
-        // Unknown event types — skip gracefully
-      } catch {
-        // Non-JSON line — emit as raw progress
-        enqueue({ type: 'progress', content: line, timestamp: new Date() });
-      }
+    /** Out of budget (total or idle): kill and end the stream with the reason. */
+    const expire = (message: string): void => {
+      if (timedOut) return;
+      timedOut = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      log(`${message} — terminating agent`);
+      terminateWithEscalation(proc);
+      channel.push({ type: 'error', content: message, timestamp: new Date() });
+      channel.close();
     };
 
-    proc.stdout?.on('data', (chunk: Buffer | string) => {
-      lineBuffer += chunk.toString();
-      const lines = lineBuffer.split('\n');
-      lineBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        processStreamLine(trimmed);
+    const timeoutMs = options?.timeout;
+    if (timeoutMs) {
+      timeoutId = setTimeout(() => expire(agentTimeoutMessage(timeoutMs)), timeoutMs);
+    }
+    watchProcessIdle(proc, options?.idleTimeout, (message) => {
+      if (!resultSeen) expire(message);
+    });
+    // The caller's cancel ends the stream the way a timeout does.
+    const abortWatch = watchAbortSignal(proc, options?.abortSignal, {
+      onAbort: () => expire(AGENT_ABORTED_MESSAGE),
+    });
+
+    const accumulator = createLineAccumulator((line) => {
+      const parsed = parseJsonLine(line);
+      if (!parsed) {
+        // Non-JSON line — emit as raw progress
+        channel.push({ type: 'progress', content: line, timestamp: new Date() });
+        return;
       }
-    });
 
-    proc.stderr?.on('data', (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on('error', (err: Error) => {
-      if (timeoutId) clearTimeout(timeoutId);
-      spawnError = err;
-      enqueue(null);
-    });
-
-    proc.on('close', (code: number | null) => {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (timedOut) return; // already handled by timeout callback
-
-      if (lineBuffer.trim()) {
-        processStreamLine(lineBuffer.trim());
+      if (parsed.type === EVENT_TYPE_MESSAGE_DELTA && parsed.delta) {
+        channel.push({
+          type: 'progress',
+          content: contentToText(parsed.delta),
+          timestamp: new Date(),
+        });
+        return;
       }
+
+      if (parsed.type === EVENT_TYPE_MESSAGE && parsed.content) {
+        // Accumulate final text; streaming progress already yielded via deltas
+        resultText += contentToText(parsed.content);
+        return;
+      }
+
+      if (parsed.type === EVENT_TYPE_RESULT) {
+        resultSeen = true;
+        // Final event — yield result with accumulated text
+        const event: AgentExecutionStreamEvent = {
+          type: 'result',
+          content: resultText,
+          timestamp: new Date(),
+        };
+        if (typeof parsed.sessionId === 'string') event.sessionId = parsed.sessionId;
+        channel.push(event);
+        return;
+      }
+
+      if (parsed.type === EVENT_TYPE_ERROR) {
+        channel.push({
+          type: 'error',
+          content: asText(parsed.message ?? parsed.content) || 'Unknown error',
+          timestamp: new Date(),
+        });
+      }
+
+      // Unknown event types — skip gracefully
+    });
+
+    proc.stdout?.on('data', (chunk: Buffer | string) => accumulator.push(chunk));
+    proc.stderr?.on('data', (chunk: Buffer | string) => stderr.push(chunk));
+
+    proc.on('error', (error: Error & { code?: string }) => {
+      processClosed = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      channel.push({
+        type: 'error',
+        content: classifySpawnError(error, COPILOT_NOT_FOUND_MESSAGE).message,
+        timestamp: new Date(),
+      });
+      channel.close();
+    });
+
+    proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      processClosed = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      if (timedOut) return; // already reported by the timeout callback
+
+      accumulator.flush();
 
       if (code !== 0 && code !== null) {
-        const authError = this.detectAuthError(stderr);
-        const msg =
-          authError ??
-          (stderr.trim()
-            ? `Process exited with code ${code}: ${stderr.trim()}`
-            : `Process exited with code ${code}`);
-        enqueue({ type: 'error', content: msg, timestamp: new Date() });
+        const authError = detectAuthError(stderr.text());
+        const detail = stderr.text().trim();
+        channel.push({
+          type: 'error',
+          content:
+            authError ??
+            (detail
+              ? `Process exited with code ${code}: ${detail}`
+              : `Process exited with code ${code}`),
+          timestamp: new Date(),
+        });
+      } else if (!resultSeen) {
+        // Same rule as execute(): a kill or a clean exit before the `result`
+        // event is a cut turn.
+        channel.push({
+          type: 'error',
+          content:
+            code === null
+              ? signalTerminationMessage(signal, stderr.text())
+              : TURN_NOT_COMPLETED_MESSAGE,
+          timestamp: new Date(),
+        });
       }
-      enqueue(null);
+      channel.close();
     });
 
     try {
-      while (true) {
-        await waitForItem();
-        const item = queue.shift();
-        if (item === null || item === undefined) {
-          if (spawnError !== null) {
-            yield {
-              type: 'error' as const,
-              content: (spawnError as Error).message,
-              timestamp: new Date(),
-            };
-          }
-          return;
-        }
-        yield item;
-      }
+      yield* channel;
     } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      abortWatch.stop();
+      // A consumer that breaks out of the loop would otherwise leave the agent
+      // running until it finished on its own.
+      if (!processClosed) terminateWithEscalation(proc);
       await preparedPrompt.cleanup();
     }
+  }
+
+  /** Validate policy and build the per-call logger shared by both entry points. */
+  private startRun(options?: AgentExecutionOptions): ExecutorLogger {
+    const log = createExecutorLogger(options?.silent);
+    const warning = validateSecurityConstraints(
+      options?.securityConstraints,
+      CopilotCliExecutorService.CAPABILITIES
+    );
+    if (warning) log(warning);
+    return log;
   }
 
   /**
    * Build CLI args for the copilot invocation.
    * Prompt is passed via -p flag (not stdin).
    */
-  private buildArgs(prompt: string, options?: AgentExecutionOptions): string[] {
+  private buildArgs(
+    prompt: string,
+    options: AgentExecutionOptions | undefined,
+    log: ExecutorLogger
+  ): string[] {
     const args = ['-p', prompt, ...BASE_FLAGS];
 
     if (options?.model) {
-      args.push('--model', this.normalizeModel(options.model));
+      args.push('--model', this.normalizeModel(options.model, log));
     }
     if (options?.resumeSession) args.push(`--resume=${options.resumeSession}`);
 
     // Unsupported options — log and ignore
     if (options?.allowedTools?.length) {
-      this.log('allowedTools option is not supported by Copilot CLI — ignoring');
+      log('allowedTools option is not supported by Copilot CLI — ignoring');
     }
     if (options?.systemPrompt) {
-      this.log('systemPrompt option is not supported by Copilot CLI — ignoring');
+      log('systemPrompt option is not supported by Copilot CLI — ignoring');
     }
     if (options?.outputSchema) {
-      this.log('outputSchema option is not supported by Copilot CLI — ignoring');
+      log('outputSchema option is not supported by Copilot CLI — ignoring');
     }
 
     return args;
@@ -463,17 +575,17 @@ export class CopilotCliExecutorService implements IAgentExecutor {
   /**
    * Normalize legacy model names to the canonical Copilot CLI form.
    */
-  private normalizeModel(model: string): string {
+  private normalizeModel(model: string, log: ExecutorLogger): string {
     const alias = LEGACY_MODEL_ALIASES[model];
     if (alias) {
-      this.log(`Normalizing legacy model alias "${model}" to "${alias}"`);
+      log(`Normalizing legacy model alias "${model}" to "${alias}"`);
       return alias;
     }
 
     // Generic fallback for legacy GPT names like gpt-5-2-codex -> gpt-5.2-codex.
     const genericGptAlias = model.replace(/^gpt-(\d+)-(\d+)(.*)$/i, 'gpt-$1.$2$3');
     if (genericGptAlias !== model) {
-      this.log(`Normalizing legacy model alias "${model}" to "${genericGptAlias}"`);
+      log(`Normalizing legacy model alias "${model}" to "${genericGptAlias}"`);
       return genericGptAlias;
     }
 
@@ -520,63 +632,40 @@ export class CopilotCliExecutorService implements IAgentExecutor {
       },
     };
   }
+}
 
-  private buildSpawnOptions(options?: AgentExecutionOptions): Record<string, unknown> {
-    const spawnOpts: Record<string, unknown> = {};
-    if (options?.cwd) spawnOpts.cwd = options.cwd;
-
-    // Explicitly pipe stdio so streams are available
-    spawnOpts.stdio = ['pipe', 'pipe', 'pipe'];
-
-    // On Windows: windowsHide=true to prevent blank console windows.
-    // Copilot CLI is a Node.js binary, so shell=true is NOT needed.
-    if (process.platform === 'win32') {
-      spawnOpts.windowsHide = true;
-    }
-
-    // Strip CLAUDECODE env var to prevent "nested session" error when shep
-    // is invoked from within a Claude Code session.
-    const { CLAUDECODE: _, ...cleanEnv } = process.env;
-
-    // Copilot CLI uses GitHub OAuth — no API key injection.
-    spawnOpts.env = cleanEnv;
-
-    return spawnOpts;
+/**
+ * Extract token usage from the Copilot CLI result event usage object.
+ * Returns undefined if usage data is absent (does not throw).
+ */
+function extractUsage(
+  usage: Record<string, unknown>
+): { inputTokens: number; outputTokens: number } | undefined {
+  if (typeof usage.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') {
+    return undefined;
   }
+  return { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens };
+}
 
-  /**
-   * Extract token usage from the Copilot CLI result event usage object.
-   * Returns undefined if usage data is absent (does not throw).
-   */
-  private extractUsage(
-    usage: Record<string, unknown>
-  ): { inputTokens: number; outputTokens: number } | undefined {
-    if (typeof usage.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') {
-      return undefined;
-    }
-    return { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens };
+/**
+ * Detect authentication-related errors in stderr and return a user-friendly message.
+ * Returns null if no auth error is detected.
+ */
+function detectAuthError(stderr: string): string | null {
+  if (!stderr) return null;
+  const lowerStderr = stderr.toLowerCase();
+  if (
+    lowerStderr.includes('not logged in') ||
+    lowerStderr.includes('authentication') ||
+    lowerStderr.includes('auth') ||
+    lowerStderr.includes('unauthorized') ||
+    lowerStderr.includes('login required')
+  ) {
+    return (
+      'GitHub Copilot CLI authentication required. ' +
+      'Run: copilot auth login\n' +
+      `Original error: ${stderr.trim()}`
+    );
   }
-
-  /**
-   * Detect authentication-related errors in stderr and return a user-friendly message.
-   * Returns null if no auth error is detected.
-   */
-  private detectAuthError(stderr: string): string | null {
-    if (!stderr) return null;
-    const lowerStderr = stderr.toLowerCase();
-    if (
-      lowerStderr.includes('not logged in') ||
-      lowerStderr.includes('authentication') ||
-      lowerStderr.includes('auth') ||
-      lowerStderr.includes('unauthorized') ||
-      lowerStderr.includes('login required')
-    ) {
-      return (
-        'GitHub Copilot CLI authentication required. ' +
-        'Run: copilot auth login\n' +
-        `Original error: ${stderr.trim()}`
-      );
-    }
-    return null;
-  }
+  return null;
 }

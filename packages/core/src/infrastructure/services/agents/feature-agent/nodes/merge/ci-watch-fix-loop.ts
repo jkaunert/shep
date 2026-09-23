@@ -14,10 +14,16 @@ import type { IGitPrService } from '@/application/ports/output/services/git-pr-s
 import { CiStatus, type CiFixRecord } from '@/domain/generated/output.js';
 import type { NodeLogger, MemorySelector } from '../node-helpers.js';
 import { retryExecute } from '../node-helpers.js';
+import { TRANSIENT_ERROR_CATEGORIES } from '../agent-retry.js';
 import type { AgentExecutionOptions } from '@/application/ports/output/agents/agent-executor.interface.js';
 import { buildCiWatchFixPrompt, buildCiWatchPrompt } from '../prompts/merge-prompts.js';
-import { parseCiWatchResult } from './merge-output-parser.js';
-import { extractRunId, handleCiTerminalFailure, buildCiExhaustedError } from './ci-helpers.js';
+import { parseCiWatchResult, type CiWatchParseStatus } from './merge-output-parser.js';
+import {
+  extractRunId,
+  handleCiTerminalFailure,
+  buildCiExhaustedError,
+  hasCiWorkflowConfig,
+} from './ci-helpers.js';
 import { getSettings } from '@/infrastructure/services/settings.service.js';
 import { recordPhaseStart, recordPhaseEnd } from '../../phase-timing-context.js';
 
@@ -46,7 +52,12 @@ export interface CiWatchFixParams {
 export type CiFixStatusValue = 'idle' | 'watching' | 'fixing' | 'success' | 'exhausted' | 'timeout';
 
 export interface CiWatchFixResult {
-  ciStatus: CiStatus;
+  /**
+   * The CI verdict for this branch, or `null` when the repository has no CI
+   * at all — there is then nothing to report, which is distinct from
+   * {@link CiStatus.Indeterminate} ("CI exists but we could not read it").
+   */
+  ciStatus: CiStatus | null;
   ciFixAttempts: number;
   ciFixHistory: CiFixRecord[];
   ciFixStatus: CiFixStatusValue;
@@ -67,7 +78,7 @@ async function watchCiViaAgent(
   timeoutMs: number,
   log: NodeLogger
 ): Promise<{
-  status: 'success' | 'failure';
+  status: CiWatchParseStatus;
   summary?: string;
   runUrl?: string;
   usage?: {
@@ -88,10 +99,12 @@ async function watchCiViaAgent(
   });
 
   try {
-    const result = await retryExecute(executor, watchPrompt, watchOptions, {
-      maxAttempts: 1,
-      logger: log,
-    });
+    // Default retry budget: a single transient executor error (API 5xx, a
+    // dropped connection) must not be reported as a CI failure — that spends a
+    // fix attempt on a green build — nor as a CI timeout that ends the merge.
+    // A real watch timeout ("Agent execution timed out") is non-retryable and
+    // still surfaces on the first attempt.
+    const result = await retryExecute(executor, watchPrompt, watchOptions, { logger: log });
 
     const elapsed = Date.now() - watchStart;
     await recordPhaseEnd(timingId, elapsed, {
@@ -118,7 +131,10 @@ async function watchCiViaAgent(
       return { status: 'failure', summary: 'CI watch timed out', timedOut: true };
     }
 
-    // For other errors, treat as indeterminate (failure)
+    // A failed watch call is kept as `failure`, not `indeterminate`: it is a
+    // transient, retryable condition, and the fix loop's retry recovers from
+    // a `gh` hiccup. `indeterminate` is reserved for the cases where retrying
+    // cannot help (rate limit, no run, agent explicitly reports it).
     return { status: 'failure', summary: `CI watch agent error: ${errMsg.slice(0, 200)}` };
   }
 }
@@ -152,11 +168,18 @@ export async function runCiWatchFixLoop(
   try {
     initialCiStatus = await gitPrService.getCiStatus(cwd, branch);
   } catch (err) {
-    // Handle GitHub API rate limits gracefully — skip CI watching
+    // A GitHub API rate limit is not a CI verdict — record it as such.
     const errMsg = err instanceof Error ? err.message : String(err);
     if (errMsg.includes('rate limit') || errMsg.includes('403')) {
-      log.info('GitHub API rate limit hit — skipping CI watch');
-      return { ciStatus: CiStatus.Success, ciFixAttempts, ciFixHistory, ciFixStatus: 'idle' };
+      // We were rate-limited, so we never learned whether CI is green. That
+      // is indeterminate, not a pass — it blocks auto-merge and escalates.
+      log.info('GitHub API rate limit hit — CI status unknown (indeterminate)');
+      return {
+        ciStatus: CiStatus.Indeterminate,
+        ciFixAttempts,
+        ciFixHistory,
+        ciFixStatus: 'idle',
+      };
     }
     throw err;
   }
@@ -187,11 +210,22 @@ export async function runCiWatchFixLoop(
           };
         }
       } catch {
-        // getMergeableStatus failed — fall through to idle/success
+        // getMergeableStatus failed — fall through to the CI-config check
       }
     }
-    log.info('No CI run detected after push — skipping CI watch');
-    return { ciStatus: CiStatus.Success, ciFixAttempts, ciFixHistory, ciFixStatus: 'idle' };
+    // No run, and the PR is not blocked by conflicts. Whether that is fine
+    // depends entirely on whether this repository has CI at all.
+    if (!hasCiWorkflowConfig(cwd)) {
+      log.info('No CI run detected and no CI workflows configured — nothing to watch');
+      return { ciStatus: null, ciFixAttempts, ciFixHistory, ciFixStatus: 'idle' };
+    }
+    log.info('CI workflows are configured but no run was observed — CI status indeterminate');
+    return {
+      ciStatus: CiStatus.Indeterminate,
+      ciFixAttempts,
+      ciFixHistory,
+      ciFixStatus: 'idle',
+    };
   }
 
   let runUrl = initialCiStatus.runUrl;
@@ -217,6 +251,19 @@ export async function runCiWatchFixLoop(
   if (watchResult.status === 'success') {
     log.info('CI passed on first watch');
     return { ciStatus: CiStatus.Success, ciFixAttempts, ciFixHistory, ciFixStatus: 'success' };
+  }
+
+  if (watchResult.status === 'indeterminate') {
+    // There is no failure to fix — we simply do not know CI's verdict.
+    // Spending fix attempts on that would be guesswork; escalate instead.
+    log.info(`CI status indeterminate on first watch: ${watchResult.summary ?? 'no detail'}`);
+    messages.push(`[merge] CI status could not be determined — human approval required`);
+    return {
+      ciStatus: CiStatus.Indeterminate,
+      ciFixAttempts,
+      ciFixHistory,
+      ciFixStatus: 'idle',
+    };
   }
 
   // CI failed — enter fix loop
@@ -257,8 +304,14 @@ export async function runCiWatchFixLoop(
       }
     }
 
-    // Invoke fix executor — maxAttempts:1 prevents retryExecute's internal
-    // retry logic from consuming CI fix attempts behind the outer loop's back.
+    // Invoke the fix executor with the default retry budget, restricted to
+    // TRANSIENT errors (API 429/5xx, dropped connections). Re-running the fix
+    // after one of those is safe even if it struck mid-turn: the prompt carries
+    // only the CI failure logs, and the fix agent re-reads the worktree and
+    // branch as they are now, so work a cut-off attempt already committed or
+    // pushed is seen and built on, not redone. Anything else (an unknown
+    // failure, a cut stream, a timeout) is not retried here — it counts as a
+    // failed fix attempt and the next CI watch judges what the agent left.
     const fixPrompt = buildCiWatchFixPrompt(
       failureLogs,
       ciFixAttempts + 1,
@@ -268,7 +321,7 @@ export async function runCiWatchFixLoop(
     );
     try {
       const fixResult = await retryExecute(executor, fixPrompt, options, {
-        maxAttempts: 1,
+        retryOn: TRANSIENT_ERROR_CATEGORIES,
         logger: log,
       });
       await recordPhaseEnd(fixTimingId, Date.now() - fixStart, {
@@ -315,6 +368,23 @@ export async function runCiWatchFixLoop(
       });
       ciFixStatus = 'timeout';
       break;
+    }
+
+    if (fixWatchResult.status === 'indeterminate') {
+      log.info(`CI status indeterminate after fix attempt ${ciFixAttempts}`);
+      ciFixHistory.push({
+        attempt: ciFixAttempts,
+        startedAt,
+        failureSummary: failureLogs.slice(0, 500),
+        outcome: 'failed',
+      });
+      messages.push(`[merge] CI status could not be determined — human approval required`);
+      return {
+        ciStatus: CiStatus.Indeterminate,
+        ciFixAttempts,
+        ciFixHistory,
+        ciFixStatus: 'idle',
+      };
     }
 
     const outcome = fixWatchResult.status === 'success' ? 'fixed' : 'failed';

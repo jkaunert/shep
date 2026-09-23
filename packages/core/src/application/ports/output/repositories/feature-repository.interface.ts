@@ -9,7 +9,11 @@
  * - Infrastructure layer provides concrete implementations
  */
 
-import type { Feature, SdlcLifecycle } from '../../../../domain/generated/output.js';
+import type {
+  AgentRunStatus,
+  Feature,
+  SdlcLifecycle,
+} from '../../../../domain/generated/output.js';
 
 /**
  * Filters for listing features.
@@ -21,6 +25,82 @@ export interface FeatureListFilters {
   includeDeleted?: boolean;
   /** When true, include archived features in results. Default: false. */
   includeArchived?: boolean;
+}
+
+/**
+ * The conditions a start claim must still hold when it reaches the database.
+ *
+ * Admission is a read-then-write — "is there a free slot / is this feature
+ * still queued?" followed by "take it" — and between those two halves another
+ * process can admit the same feature or fill the last slot. Every condition
+ * here is therefore evaluated INSIDE the write, so the answer and the action
+ * cannot be separated.
+ */
+/** Refinements to {@link IFeatureRepository.countByLifecycles}. */
+export interface CountByLifecyclesOptions {
+  /**
+   * Do not count a feature whose current agent run (`features.agent_run_id`)
+   * has one of these statuses. A worker that died or was stopped leaves the
+   * lifecycle in a running phase; its run's status is what says nothing is
+   * working on it any more. A feature with no run recorded is still counted.
+   */
+  releasingRunStatuses?: readonly AgentRunStatus[];
+}
+
+export interface FeatureStartClaim {
+  /** The feature to claim. */
+  featureId: string;
+  /** Lifecycle the feature moves to when the claim is won. */
+  targetLifecycle: SdlcLifecycle;
+  /** Stamp written to `updatedAt` by the winning claim. */
+  updatedAt: Date;
+  /**
+   * Require the row to still carry its queue marker.
+   *
+   * This is what stops two drains from admitting the same queued feature:
+   * the first claim clears `queuedAt`, so the second finds nothing to claim.
+   */
+  requireQueued?: boolean;
+  /**
+   * Require the row to still be in this lifecycle.
+   *
+   * The manual start path uses it: a feature another process already started
+   * is no longer Pending, and must not be started a second time.
+   */
+  requireLifecycle?: SdlcLifecycle;
+  /**
+   * Require the row to still point at this agent run.
+   *
+   * Resume uses it: two resumes of one feature both read the same finished
+   * run, and only the first may replace it — the second finds the pointer
+   * already moved and claims nothing.
+   */
+  requireAgentRunId?: string;
+  /**
+   * Point the feature at this agent run in the same statement. A feature whose
+   * current run is live occupies a slot, so switching to the new run IS taking
+   * the slot, and must not be a separate write.
+   */
+  agentRunId?: string;
+  /**
+   * Enforce the parallel-feature cap as part of the same statement.
+   *
+   * The count is still DERIVED (see IFeatureRepository.countByLifecycles) —
+   * what changes is that it is derived in the same statement as the write it
+   * authorises, instead of in an earlier, separate one.
+   */
+  capacity?: {
+    /** Configured limit. 0 (unlimited) skips the check. */
+    limit: number;
+    /** Lifecycles that occupy a slot. */
+    runningLifecycles: readonly SdlcLifecycle[];
+    /**
+     * Statuses of a feature's current agent run that release its slot even
+     * though its lifecycle is still a running one (see
+     * {@link CountByLifecyclesOptions.releasingRunStatuses}).
+     */
+    releasingRunStatuses?: readonly AgentRunStatus[];
+  };
 }
 
 /**
@@ -115,9 +195,13 @@ export interface IFeatureRepository {
    * forever.
    *
    * @param lifecycles - The lifecycles to count. An empty array counts nothing.
+   * @param options - Optionally exclude features whose current run has finished
    * @returns Number of matching, non-soft-deleted features
    */
-  countByLifecycles(lifecycles: SdlcLifecycle[]): Promise<number>;
+  countByLifecycles(
+    lifecycles: SdlcLifecycle[],
+    options?: CountByLifecyclesOptions
+  ): Promise<number>;
 
   /**
    * Returns features waiting for a parallel-capacity slot, oldest first.
@@ -131,6 +215,20 @@ export interface IFeatureRepository {
    * @returns Queued features in admission order, excluding soft-deleted rows
    */
   listQueued(): Promise<Feature[]>;
+
+  /**
+   * Atomically claim a feature for starting.
+   *
+   * Clears the queue marker and moves the feature into its target lifecycle,
+   * but ONLY while every condition in the claim still holds. The caller may
+   * spawn an agent exactly when this returns true — an unconditional update
+   * followed by a spawn lets two processes put two detached workers in one
+   * git worktree, sharing one agent run and one log file.
+   *
+   * @param claim - What must still be true at the moment of the write
+   * @returns True when this call performed the write and owns the spawn
+   */
+  claimForStart(claim: FeatureStartClaim): Promise<boolean>;
 
   /**
    * Delete a feature by ID (hard delete).

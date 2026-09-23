@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { FolderKanban, FileText, Search, BookOpen } from 'lucide-react';
-import { Dialog, DialogContent } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import {
   Command,
   CommandInput,
@@ -14,6 +14,7 @@ import {
   CommandSeparator,
 } from '@/components/ui/command';
 import { globalSearch } from '@/app/actions/global-search';
+import { matchesGlobalShortcut } from '@/lib/keyboard-shortcuts';
 
 interface SearchResult {
   type: 'project' | 'workItem' | 'page';
@@ -38,8 +39,9 @@ export function GlobalSearchDialog({ className }: GlobalSearchDialogProps) {
   // Register Cmd+K / Ctrl+K keyboard shortcut
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
+      if (matchesGlobalShortcut(e, 'k')) {
         e.preventDefault();
+        if (e.repeat) return;
         setOpen((prev) => !prev);
       }
     };
@@ -100,8 +102,14 @@ export function GlobalSearchDialog({ className }: GlobalSearchDialogProps) {
         data-testid="global-search-dialog"
         className="max-w-lg gap-0 overflow-hidden p-0"
       >
+        <DialogTitle className="sr-only">Search</DialogTitle>
+        <DialogDescription className="sr-only">
+          Search projects, work items, and pages.
+        </DialogDescription>
         <Command className={className}>
           <CommandInput
+            aria-label="Search projects, work items, and pages"
+            className="pe-10"
             placeholder="Search projects, work items, and pages..."
             value={query}
             onChange={handleQueryChange}

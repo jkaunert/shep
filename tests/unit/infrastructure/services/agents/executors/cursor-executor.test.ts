@@ -22,7 +22,9 @@ vi.mock('@/infrastructure/platform.js', () => ({
 
 import { CursorExecutorService } from '@/infrastructure/services/agents/common/executors/cursor-executor.service.js';
 import type { SpawnFunction } from '@/infrastructure/services/agents/common/types.js';
-import { AgentType, AgentFeature } from '@/domain/generated/output.js';
+import { AgentType, AgentFeature, SecurityMode } from '@/domain/generated/output.js';
+import { SecurityViolationError } from '@/domain/errors/security-violation.error.js';
+import { strictConstraints } from './security-constraints.fixture.js';
 
 /**
  * Creates a mock ChildProcess-like object that can emit events and provide
@@ -125,6 +127,7 @@ describe('CursorExecutorService', () => {
 
   afterEach(() => {
     Object.defineProperty(process, 'platform', { value: originalPlatform, writable: true });
+    vi.useRealTimers();
   });
 
   describe('agentType', () => {
@@ -247,7 +250,7 @@ describe('CursorExecutorService', () => {
       mockProc.stderr.end();
       mockProc.emit('close', null);
 
-      await expect(executePromise).rejects.toThrow(/timed out/i);
+      await expect(executePromise).rejects.toThrow('Agent execution timed out after 5s');
       expect(mockProc.kill).toHaveBeenCalled();
       vi.useRealTimers();
     });
@@ -584,7 +587,9 @@ describe('CursorExecutorService', () => {
 
       expect(events.length).toBeGreaterThanOrEqual(2);
       expect(events[0]).toEqual({ type: 'progress', content: 'Working on it...' });
-      expect(events[1]).toEqual({ type: 'result', content: 'sess-stream' });
+      // The result event carries the ANSWER. It used to carry the session id,
+      // so every graph node downstream received a UUID instead of the work.
+      expect(events[1]).toEqual({ type: 'result', content: 'Working on it...' });
     });
 
     it('should yield error events on subprocess failure', async () => {
@@ -851,5 +856,393 @@ describe('CursorExecutorService', () => {
       expect(progressEvents.some((e) => e.content.includes('shellToolCall'))).toBe(true);
       expect(progressEvents.some((e) => e.content.includes('readToolCall'))).toBe(true);
     });
+  });
+  // --- defects proven by audit: result mapping, quoting, UTF-8, lifetime ---
+
+  describe('stream result mapping', () => {
+    it('should emit an error for a non-zero exit even when stderr is empty', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Q', { silent: true });
+      emitStreamData(mockProc, [], null, 2);
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events).toEqual([{ type: 'error', content: 'Process exited with code 2' }]);
+    });
+
+    it('should reject execute() when the result event reports is_error', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Q', { silent: true });
+      emitStreamData(
+        mockProc,
+        [
+          buildCursorResultEvent('sess-1', 10, {
+            subtype: 'error_max_turns',
+            is_error: true,
+            result: 'Partial work',
+          }),
+        ],
+        null,
+        0
+      );
+
+      await expect(executePromise).rejects.toThrow(/error_max_turns/);
+    });
+
+    it('should reject execute() for is_error without a subtype', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Q', { silent: true });
+      emitStreamData(
+        mockProc,
+        [buildCursorResultEvent('sess-1', 10, { is_error: true, result: 'provider failed' })],
+        null,
+        0
+      );
+
+      await expect(executePromise).rejects.toThrow(/provider failed/);
+    });
+
+    it('should emit an error, not a result, when the stream result reports is_error', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Q', { silent: true });
+      emitStreamData(
+        mockProc,
+        [
+          buildCursorAssistantEvent('Partial'),
+          buildCursorResultEvent('sess-1', 10, { subtype: 'error_max_turns', is_error: true }),
+        ],
+        null,
+        0
+      );
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events.some((e) => e.type === 'result')).toBe(false);
+      expect(events.some((e) => e.type === 'error' && /error_max_turns/.test(e.content))).toBe(
+        true
+      );
+    });
+
+    it('should report the session id out of band rather than as the answer', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string; sessionId?: string }[] = [];
+      const gen = executor.executeStream('Q', { silent: true });
+
+      process.nextTick(() => {
+        mockProc.stdout.write(`${buildCursorAssistantEvent('The answer is 42.')}\n`);
+        mockProc.stdout.write(`${buildCursorResultEvent('9f1c2f4e-dead-beef', 10)}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content, sessionId: event.sessionId });
+      }
+
+      const resultEvent = events.find((e) => e.type === 'result');
+      expect(resultEvent?.content).toBe('The answer is 42.');
+      expect(resultEvent?.sessionId).toBe('9f1c2f4e-dead-beef');
+    });
+
+    it('should stringify a structured error payload instead of [object Object]', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      const gen = executor.executeStream('Q', { silent: true });
+
+      process.nextTick(() => {
+        mockProc.stdout.write(
+          `${JSON.stringify({ type: 'error', error: { code: 500, detail: 'upstream boom' } })}\n`
+        );
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      for await (const event of gen) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      const errorEvent = events.find((e) => e.type === 'error');
+      expect(errorEvent?.content).not.toContain('[object Object]');
+      expect(errorEvent?.content).toContain('upstream boom');
+    });
+  });
+
+  describe('Windows PowerShell quoting', () => {
+    it('should quote every agent flag instead of splicing settings into the command', async () => {
+      const originalPlatform = process.platform;
+      Object.defineProperty(process, 'platform', { value: 'win32', writable: true });
+
+      try {
+        const mockProc = createMockChildProcess();
+        vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+        // `model` is a free-form settings string; it must not be able to end
+        // the cursor-agent invocation and start a command of its own.
+        const hostileModel = "sonnet'; Remove-Item C:\\ -Recurse #";
+        const executePromise = executor.execute('Test', { model: hostileModel, silent: true });
+        emitStreamData(
+          mockProc,
+          [buildCursorAssistantEvent('Done'), buildCursorResultEvent('sess-1', 100)],
+          null,
+          0
+        );
+        await executePromise;
+
+        const psCmd = (vi.mocked(mockSpawn).mock.calls[0][1] as string[]).at(-1)!;
+        // Single quotes make a PowerShell literal; an embedded quote is doubled.
+        expect(psCmd).toContain("'sonnet''; Remove-Item C:\\ -Recurse #'");
+        expect(psCmd).toContain("'--yolo'");
+        expect(psCmd).not.toContain(`& cursor-agent ${hostileModel}`);
+      } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, writable: true });
+      }
+    });
+
+    it('should still pass a plain argv array on POSIX', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Test', { model: 'claude-opus-5', silent: true });
+      emitStreamData(
+        mockProc,
+        [buildCursorAssistantEvent('Done'), buildCursorResultEvent('sess-1', 100)],
+        null,
+        0
+      );
+      await executePromise;
+
+      const args = vi.mocked(mockSpawn).mock.calls[0][1] as string[];
+      expect(args).toContain('opus-5');
+      expect(args.some((a) => a.includes("'"))).toBe(false);
+    });
+  });
+
+  describe('multi-byte output', () => {
+    it('should not corrupt a character split across two stdout chunks', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const answer = 'héllo — ✅ 日本語 🚀 done';
+      const payload = Buffer.from(`${buildCursorAssistantEvent(answer)}\n`, 'utf8');
+      const splitAt = payload.indexOf(Buffer.from('🚀', 'utf8')) + 2;
+
+      const executePromise = executor.execute('Q', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(payload.subarray(0, splitAt));
+        mockProc.stdout.write(payload.subarray(splitAt));
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', 0);
+      });
+
+      expect((await executePromise).result).toBe(answer);
+    });
+  });
+
+  describe('signal termination', () => {
+    it('should reject naming the signal when killed after partial text', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Q', { silent: true });
+      process.nextTick(() => {
+        for (const line of [buildCursorAssistantEvent('partial work')])
+          mockProc.stdout.write(`${line}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+
+      await expect(executePromise).rejects.toThrow(/SIGKILL/);
+    });
+
+    it('should keep the answer when the signal arrives after the result event', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Q', { silent: true });
+      process.nextTick(() => {
+        for (const line of [buildCursorResultEvent('sess-1', 10, { result: 'all done' })])
+          mockProc.stdout.write(`${line}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGTERM');
+      });
+
+      expect((await executePromise).result).toBe('all done');
+    });
+
+    it('should stream an error, not a result, when killed after partial text', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      process.nextTick(() => {
+        for (const line of [buildCursorAssistantEvent('partial work')])
+          mockProc.stdout.write(`${line}\n`);
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+      const events: { type: string; content: string }[] = [];
+      for await (const event of executor.executeStream('Prompt', { silent: true })) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events.some((e) => e.type === 'error' && e.content.includes('SIGKILL'))).toBe(true);
+      expect(events.some((e) => e.type === 'result')).toBe(false);
+    });
+
+    it('should reject when the CLI is killed by a signal with nothing captured', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const executePromise = executor.execute('Q', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.end();
+        mockProc.stderr.end();
+        mockProc.emit('close', null, 'SIGKILL');
+      });
+
+      await expect(executePromise).rejects.toThrow(/SIGKILL/);
+    });
+  });
+
+  describe('security constraints', () => {
+    it('should refuse execute() under an enforced strict sandbox', async () => {
+      await expect(
+        executor.execute('Q', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })
+      ).rejects.toBeInstanceOf(SecurityViolationError);
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('should refuse executeStream() under an enforced strict sandbox', async () => {
+      const iterate = async () => {
+        for await (const _event of executor.executeStream('Q', {
+          silent: true,
+          securityConstraints: strictConstraints(SecurityMode.Enforce),
+        })) {
+          // validation runs before the spawn
+        }
+      };
+
+      await expect(iterate()).rejects.toBeInstanceOf(SecurityViolationError);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('executeStream lifetime', () => {
+    it('should kill the child when the consumer stops iterating early', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const gen = executor.executeStream('Q', { silent: true });
+      process.nextTick(() => {
+        mockProc.stdout.write(`${buildCursorAssistantEvent('partial')}\n`);
+      });
+
+      for await (const _event of gen) {
+        break;
+      }
+
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+
+    it('should time out a stream that never closes', async () => {
+      const mockProc = createMockChildProcess();
+      vi.mocked(mockSpawn).mockReturnValue(mockProc as any);
+
+      const events: { type: string; content: string }[] = [];
+      for await (const event of executor.executeStream('Q', { silent: true, timeout: 20 })) {
+        events.push({ type: event.type, content: event.content });
+      }
+
+      expect(events).toContainEqual({
+        type: 'error',
+        content: 'Agent execution timed out after 0.02s',
+      });
+      expect(mockProc.kill).toHaveBeenCalled();
+    });
+  });
+});
+
+describe('CursorExecutorService — idle timeout', () => {
+  // A stalled agent (hung API connection, wedged tool) used to sit out the
+  // whole total budget — 30 minutes by default, hours for a long implement
+  // stage. `idleTimeout` ends it after that long without any output.
+  let mockSpawn: SpawnFunction;
+  let executor: CursorExecutorService;
+
+  beforeEach(() => {
+    mockSpawn = vi.fn();
+    executor = new CursorExecutorService(mockSpawn);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('execute(): arms no idle guard — its single-result json mode is silent until the end', async () => {
+    // execute() runs the CLI with `--output-format json`, which prints ONE
+    // line when the whole turn is done. Silence there is the normal shape of
+    // a healthy run, so an idle guard would kill every run longer than the
+    // budget; only the total timeout bounds it.
+    vi.useFakeTimers();
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    let settled = false;
+    const pending = executor
+      .execute('Prompt', { silent: true, idleTimeout: 60_000 })
+      .finally(() => (settled = true));
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+    expect(settled).toBe(false);
+    expect(proc.kill).not.toHaveBeenCalled();
+    proc.stdout.end();
+    proc.stderr.end();
+    proc.emit('close', 1, null);
+    await pending.catch(() => undefined);
+  });
+
+  it('executeStream(): ends a silent stream with an idle-timeout error event', async () => {
+    const proc = createMockChildProcess();
+    vi.mocked(mockSpawn).mockReturnValue(proc as any);
+
+    const events: { type: string; content: string }[] = [];
+    for await (const event of executor.executeStream('Prompt', {
+      silent: true,
+      idleTimeout: 20,
+    })) {
+      events.push({ type: event.type, content: event.content });
+    }
+
+    expect(events).toContainEqual({
+      type: 'error',
+      content: 'Agent execution timed out: no output for 0.02s',
+    });
+    expect(proc.kill).toHaveBeenCalled();
   });
 });

@@ -1,5 +1,77 @@
 # Lessons Learned
 
+## Exercise real concurrency and retain subprocess errors
+
+`Promise.resolve(runner.run(...))` still runs each synchronous CLI command in
+sequence. Use asynchronous child processes sharing an isolated database to test
+startup races. SQLite can return `SQLITE_BUSY` during WAL startup without calling
+its busy handler; retry initialization within a deadline and close failed handles.
+Use `runOrThrow` for successful CLI scenarios so CI retains the command and stderr.
+Serialize the settings existence check and insert in one immediate transaction;
+if another startup wins, load its persisted settings instead of replacing them.
+Close the database synchronously on process exit. A Windows probe reproduced
+`SQLITE_IOERR_TRUNCATE` when workers exited with open WAL connections; explicit
+SQLite shutdown eliminated those I/O failures. Verify cleanup before reopening
+the file, since reopening can recover the WAL and hide the missing shutdown.
+
+## Review the complete report and the complete interaction
+
+Inspect a supplied recording's audio as well as its frames before narrowing the
+reported problem. Check long pages halfway down and at the bottom in both themes;
+an above-the-fold screenshot misses a background that ends at the first viewport.
+Exercise global shortcuts together, including extra modifiers and held keys, so
+one gesture cannot open competing panels or repeatedly toggle the same panel.
+
+## Exercise native compilation independently of caches
+
+Green PR jobs can hide an incompatible native build toolchain when they download
+prebuilt binaries. After an install failure, inspect the actual runner image and
+bundled compiler tooling, force the native source-build fallback in CI, and verify
+the binding loads. Preserve required check names when pinning a runner image.
+
+## Use the fork to verify CI while upstream approval is pending
+
+An upstream approval gate does not prevent testing in an owned fork. Check fork
+Actions permissions and run the same commit and CI matrix through a draft PR.
+Verify the merge tree matches the intended source and keep fork results distinct
+from upstream approval. Do this before treating maintainer approval as an impasse.
+
+## Finish against the pushed CI result and current review
+
+Local green checks do not complete a CI repair. Read every current PR comment,
+reproduce each reported failure, and verify every required job on the final pushed
+commit, including Windows and both Linux desktop variants. Keep PR verification
+claims current and give every consent gate a usable approval command.
+
+## Verify shared artwork and complete pages in both themes
+
+A successful page load and an automated accessibility scan do not prove visual
+quality. Inspect every shared logo in light and dark mode, check image decoding,
+and exercise the complete page at desktop, narrow mobile and browser zoom sizes.
+Record route and interaction coverage explicitly before describing a UI review
+as complete; an Applications-only screenshot cannot verify Control Center.
+
+## Check ownership before committing in a shared checkout
+
+Re-read Git status and the index before every commit. Stage only paths whose
+changes belong to this session, leave another agent's work intact, and check
+status again after hooks restore unstaged changes. A handoff saying the tree
+is clean never replaces checking its current state.
+
+## Close actionable findings before calling a review complete
+
+When asked to finish an end-to-end review, investigate expected failures and
+remaining advisories instead of treating their existing status as an exemption.
+Prove fixes with regressions, exercise omitted local workflows, and distinguish
+completed verification from checks that require an unavailable environment.
+
+## Recover the conversation before resuming interrupted work
+
+When asked to find a crashed session, locate the actual session record by workspace
+and timestamp, recover its user request and last tool results, and report its ID.
+A dirty branch or saved plan alone does not establish which conversation to resume.
+Treat checks interrupted by the crash as incomplete and persist the remaining work.
+
 ## `kill()` is a signal, not a join — never remove a directory a process just left
 
 A pty unit test created a temp dir, spawned a real shell in it, called `close()`,
@@ -2209,9 +2281,10 @@ pending or failed external PR checks. The CI watch loop must preserve that
 status; treating every URL-less result as success turns unresolved branch
 protection checks into a false green.
 
-**Rule:** Only the explicit no-workflow/no-checks case is neutral success. A
-pending or failed PR check must remain pending or failed through the merge-node
-path, with regression tests covering both no-Actions cases.
+**Rule:** Only the explicit no-workflow/no-checks case may complete without a
+CI verdict. Do not manufacture `Success`; record no status when no CI exists,
+and use `Indeterminate` when CI is configured but no run was observed. Pending
+or failed PR checks must remain non-success through the merge-node path.
 
 ## CI evidence is tied to the PR merge base
 
@@ -2364,6 +2437,11 @@ Rules:
    somewhere a human looks daily.
 4. **Verify the build context, not just the Dockerfile text.** `.dockerignore` decides whether
    a COPY can resolve at all; confirm the file lands at the exact path the hook invokes.
+5. **Dependency patches are install inputs.** Copy `patches/` before every install stage
+   when `pnpm.patchedDependencies` references it; `--ignore-scripts` does not skip patches.
+6. **Probe native modules in the final runtime.** With scripts disabled, rebuilding only
+   `better-sqlite3` leaves `node-pty` unavailable. Exercise a database query, terminal spawn,
+   and web readiness as the image's default user after the build succeeds.
 
 ## An issue reference in a commit body makes commitlint fail `footer-leading-blank`
 
@@ -2389,3 +2467,280 @@ Rules:
    so the config's `extends` resolves, then `commitlint --from <base> --to HEAD`. Cheaper
    than a CI round trip. Remove the symlink afterwards — `.gitignore`'s `node_modules/`
    pattern does not match a symlink, so it shows up as untracked.
+
+## A gate that reads an LLM's words must fail CLOSED on every shape it did not expect
+
+An audit found three governance gates — the ones standing between an agent with shell
+access plus push rights and a merge — all failing OPEN. Not one of them had a bug in its
+happy path; each had a *default* that pointed the wrong way.
+
+1. **The supervisor verdict parser looped over the verdict list, not the text.**
+   `for (const candidate of [approve, reject, escalate, advise]) if (lower.includes(...))`
+   returns `approve` whenever the word appears anywhere — including in the most common way
+   a model phrases a refusal: "I cannot give verdict: approve here. verdict: reject". A
+   human approval gate auto-approved on a rejected review.
+2. **The CI parser tested PASSED before FAILED on the same line.** The prompt asks the
+   agent to summarise *which runs failed*, so `CI_STATUS: FAILED — 3 of 4 runs reported
+   CI_STATUS: PASSED, but lint failed` is the specified output shape — and it parsed as
+   success. The FAILED branch also required an em-dash to capture its summary, so an ASCII
+   hyphen silently discarded the reason.
+3. **Absence of evidence was recorded as evidence of success.** A 403 from the GitHub API,
+   and "no CI run detected at all", both returned `CiStatus.Success`. The prompt even told
+   the agent to *report* `CI_STATUS: PASSED` when rate-limited.
+4. **Exit code 0 is not "it finished".** The Claude CLI emits
+   `{"type":"result","subtype":"error_max_turns","is_error":true}` and exits 0; the AI SDK
+   returns `finishReason: 'length'` with a fragment. Both read as completed runs.
+5. **`catch { return [] }` erases the difference between "nothing" and "unreadable".**
+   `tasks.yaml` missing → `[]` → the completeness loop iterated over nothing and reported
+   `valid: true`, accepting zero evidence as a pass. Two byte-identical
+   ` ```json ` regexes returned `[]` for ` ```JSON `, a bare fence, and a single-line
+   fence, so project memory could stop accumulating and log the same line as success.
+
+Rules:
+
+1. **Scan the text for the marker, never the enum for a substring.** Anchor the marker to
+   the start of a line (`^\s*\**\s*verdict:?\**\s*(\w+)`) so prose that *mentions* a
+   verdict is not a verdict, and read bottom-up so a model that revises itself is read
+   correctly.
+2. **Test the blocking branch before the passing branch, on the same line.** Whenever two
+   patterns can match one line, the order *is* the policy.
+3. **Two different answers means escalate, not pick one.** A parser that guesses between
+   `approve` and `reject` has chosen `approve` half the time.
+4. **"I could not check" needs its own value.** Collapsing it into the passing value is the
+   bug; collapsing it into the failing one breaks every repo that legitimately has no CI.
+   `CiStatus.Indeterminate` blocks and escalates; `null` (no CI configured at all) does
+   not. Tell them apart with evidence — `.github/workflows/*.yml` exists — not a guess.
+5. **Put a `never` exhaustiveness check wherever you branch on a domain enum.** Adding
+   `Indeterminate` to `CiStatus` then breaks the build at every site that must state an
+   opinion, instead of silently defaulting to "allowed". `ciStatusBlocksAutoMerge()` and
+   `CiStatusBadge` are those sites.
+6. **A parse result must distinguish "found empty" from "found nothing".** `{ found,
+   items, failure }`, and the caller logs the two differently — otherwise a pipeline that
+   has stopped receiving data looks exactly like one with nothing to report.
+7. **Before adding tolerance to a duplicated parser, extract it.** The fence regex existed
+   twice, byte-identical; fixing it in place would have fixed one of them.
+
+## A read that authorises a write must live in the same statement as the write
+
+Shep runs many OS processes against ONE SQLite file — the daemon, every CLI
+invocation, and one detached worker per running feature — so every
+"check, then act" in the database is a race with a real trigger, not a
+theoretical one. A DB audit reproduced five of them:
+
+- Two processes computed the same pending migration set and both executed it.
+  The loser died on `UNIQUE constraint failed: umzug_migrations.name`, having
+  already re-run the DDL. First launch after any upgrade is exactly this.
+- `listQueued()` then `getRunningCount()` then an unconditional
+  `UPDATE features ... WHERE id = ?` then a spawn: two detached workers in ONE
+  git worktree, sharing one agent run and one log file.
+- `hasCapacity()` read 2-running-of-3 in one transaction and the caller started
+  a feature in another — twice.
+- The crash sweep read `status = 'running'`, then `isAlive(pid)` said "dead"
+  because the worker had just written `completed` and exited — the NORMAL exit
+  path — and an unguarded `UPDATE agent_runs ... WHERE id = ?` reported a
+  successful run to the user as crashed.
+
+Rules:
+
+1. **Put the condition in the WHERE clause and gate on `.changes`.** `UPDATE …
+   WHERE id = ? AND queued_at IS NOT NULL` returning 1 *is* the claim; an `if`
+   above the statement is a check another process can invalidate. A derived
+   count is still right (see the parallel-cap lesson) — derive it in a
+   sub-select inside the authorising statement, not in an earlier one.
+2. **Cross-process serialisation is a one-statement conditional INSERT with a
+   TTL**, the shape `pr-sync-watcher` already used. The loser WAITS and re-reads;
+   it never proceeds and never crashes. `busy_timeout` does not help here — this
+   is two legitimate writers, not lock contention.
+3. **Make transactionality structural.** 135 of 136 migration files had no
+   transaction, so each multi-statement one had a partial-apply window;
+   migration 097 lost `supervisor_policies.app_id` through it (ADD COLUMN, die,
+   re-run takes the "already migrated" branch, DROP still fires). Wrap
+   execution once in the runner rather than editing 136 files. SQLite rolls DDL
+   back, unlike several other engines — `ALTER TABLE`, `DROP COLUMN` and
+   `CREATE INDEX` are all safe inside a transaction.
+4. **`db.transaction()` is DEFERRED; a read-then-write needs `.immediate()`.**
+   A deferred transaction takes its read snapshot before the write lock, so a
+   concurrent writer turns it into SQLITE_BUSY_SNAPSHOT — which `busy_timeout`
+   does NOT retry. Write-only transactions are fine deferred.
+5. **A terminal-status guard must be opt-in, not a default.** Resuming an
+   interrupted run is a legitimate terminal→running transition; a blanket guard
+   would refuse it and leave a live agent reported as crashed.
+6. **Never wrap an indexed column in a function.** `WHERE
+   REPLACE(repository_path, '\', '/') = ?` made `idx_features_repo` unusable and
+   `findByBranch` visited every live row. Normalise on WRITE, back-fill existing
+   rows in a migration, and compare the column directly. `EXPLAIN QUERY PLAN` is
+   the proof — and read the whole plan: matching `deleted_at IS NULL` also says
+   "USING INDEX" while scanning everything.
+7. **A method nothing calls is not a feature.** `pruneBefore()` existed on the
+   operation log with zero callers while the database grew ~184 MB a year.
+   Grep for a caller before counting a capability as shipped.
+
+## A `Buffer.toString()` per chunk silently corrupts every multi-byte character
+
+All six CLI agent executors read stdout with `lineBuffer += chunk.toString()`. stdio is
+`['pipe','pipe','pipe']` with no encoding, so chunks are Buffers, and a 4-byte emoji or a
+CJK character that straddles a 64 KiB pipe boundary decodes to U+FFFD on both sides.
+`héllo — ✅ 日本語 🚀 done` arrived as `héllo — ✅ 日本語 ??? done`. The damage is invisible:
+replacement characters are legal JSON, so `JSON.parse` succeeds and the corrupted text flows
+into results, commit messages and PR bodies. The existing "split across chunks" tests used
+`String.slice` on ASCII, so they could never land mid-codepoint.
+
+**Rules:**
+
+1. Decode a byte stream with `StringDecoder`, never `chunk.toString()` per chunk. One shared
+   reader (`process-stream.ts#createLineAccumulator`) is the only place that has to be right.
+2. A chunk-splitting test that slices a JS string proves nothing. Split a real `Buffer` inside
+   a multi-byte sequence — `payload.indexOf(Buffer.from('🚀','utf8')) + 2`.
+3. `lineBuffer +=` with no ceiling is also a `RangeError` waiting in a `'data'` listener,
+   which throws *outside* every try and kills the worker. Bound the line and ring-buffer
+   stderr, whose tail is the only part ever read.
+
+## `code === null` on 'close' is a kill, not a clean exit
+
+`if (code !== 0 && code !== null)` reads as "ignore the kill case". It means the OOM killer
+takes the agent and the run RESOLVES with `result: ''` — a success with no work in it.
+
+**Rule:** reject on `code === null` unless a result was already captured, and name the signal
+(`close` passes it as the second argument). The same shape applies to a stream: emit an error
+event, not an empty result.
+
+## A piped prompt needs an `error` listener on stdin
+
+`proc.stdin.write(prompt)` with no `'error'` handler: when the CLI exits early (bad flag, auth
+failure, a timeout kill) the in-flight write raises EPIPE on the stream, and a stream error
+with no listener reaches `process.on('uncaughtException')` — killing the worker instead of
+failing the run. Prompts are piped precisely because they are large, so a write is always in
+flight. `process-stream.ts#writePromptToStdin` attaches the handler and lets the
+`close`/`exit` handler report the real reason.
+
+## Breaking out of a `for await` over an executor leaves the agent running
+
+No `executeStream` generator had a `finally`, so a consumer that stopped iterating (found its
+answer, hit its own error) left the child holding a worktree and burning tokens until it
+exited on its own. A generator's `finally` runs on `.return()`, which is what `break` calls.
+
+**Rule:** every generator that owns a process kills it in `finally`, guarded by a
+`processClosed` flag so a normal end does not signal a pid that may have been reused.
+
+## Stderr scanning must never overrule a result that exists
+
+`/failed with status 4\d{2}\. Retrying/` is what the Gemini CLI prints when it RETRIES — a
+retry that then succeeds exits 0 with a full response, and the executor rejected it anyway.
+Codex did the same with `/rate.?limit/i` against `[warn] approaching rate limit`.
+
+**Rule:** match exhaustion, not the attempt, and consult stderr only when stdout produced no
+answer. A completed message is the run's outcome; stderr noise from a call the CLI recovered
+from must not discard finished work.
+
+## The session id is not the answer
+
+`cursor-executor` returned `{ type: 'result', content: parsed.session_id }`, and
+`streaming-executor-proxy` keeps `event.content` of the last result event — so every graph
+node running under `agent.type = cursor` received a UUID where the work should have been.
+`kimi-code` had the same line. An identifier travels in its own field (`sessionId`), never in
+the field callers read as the answer.
+
+**Rule:** when one event carries both an identifier and text, give the identifier a named
+field. A test that asserts `content: 'sess-stream'` is pinning the defect, not the contract.
+
+## `private silent = false` on a cached executor is shared mutable state
+
+The executor factory caches one instance per agent type. A `silent` field set per call means
+two agents running in parallel mute each other, and a stream that never sets it inherits the
+previous call's value. A logger built per call (`createExecutorLogger(options?.silent)`)
+carries the flag with it and cannot be overwritten.
+
+## An overlay pinned over the canvas must reserve its space
+
+`FleetControl` mounted `absolute top-3 right-3 z-20` over the Control Center canvas.
+`pointer-events-none` on the wrapper let clicks through the padding, so the mount looked
+safe — but the pill itself is opaque, and it covered both the canvas chrome in the same
+band and whatever feature node dagre laid out underneath it. Shipping it took a UI surface
+away from the user to add a summary of that same surface.
+
+**Rule:** a surface drawn over the canvas either lives in real chrome (app shell header,
+session-tree sidebar) or the canvas viewport is inset so nothing is ever laid out beneath
+it. `pointer-events-none` answers "can I click through it", never "can I see through it" —
+and never check only the empty-canvas case, since the overlap appears exactly when the
+canvas is full.
+
+## A status only one writer guards is a status any writer can overturn
+
+Spec 116 audited shep against an external list of agent-harness bugs. The `allowedFrom` guard on
+`agent_runs.updateStatus` existed, but only the crash sweep used it. Every other writer — the
+worker's boot/heartbeat/terminal writes, Stop, Approve, Reject — wrote `WHERE id = ?`, so a Stop
+issued while the worker booted was overwritten by its first heartbeat, and two concurrent
+approvals each spawned a worker into one worktree.
+
+**Rules:**
+
+1. **Every status writer states the statuses it may leave.** The worker may write `running` only
+   from `pending`/`running` and a terminal status only from `running`; Stop only from a
+   non-terminal status; Approve/Reject only from a resumable one. The boolean the write returns
+   IS the claim — a worker whose boot claim fails exits before building its graph.
+2. **Record a stop before you signal.** Signalling first lets the dying worker's own write land
+   first, and then the stop looks like it failed.
+3. **A claim needs a release on the path that cannot finish.** A run claimed to `running` whose
+   worker fails to spawn has no owner; hand the claim back (guarded on `running`) and rethrow.
+
+## "It ended" is not "it answered" — for streams as much as for exit codes
+
+`StreamingExecutorProxy.execute()` only caught thrown errors, but subprocess executors report
+timeouts, kills and non-zero exits as an `error` stream event and then end — so every failed
+`shep run` stream was recorded as a completed run with `result: ''`. It also closed the shared
+channel after every node, silently dropping the events of every node after the first.
+
+**Rules:**
+
+1. The last `result`/`error` event decides a stream's outcome; a stream with neither was cut
+   short and rejects.
+2. A signal kill rejects even with partial output unless the CLI's terminal event (Codex
+   `turn.completed`, Claude/Cursor/Copilot `result`) was already seen.
+3. Whoever owns a channel's lifetime closes it once; a per-call helper must never close it.
+
+## An SSE comment is invisible to EventSource
+
+`': heartbeat\n\n'` keeps proxies from idling out a connection, but `EventSource` never
+dispatches comments to page code, so a client watchdog reset only by events tore down a healthy
+quiet stream every 60s — and each reconnect replayed the full message/question history because
+per-connection caches started empty. Send a named `heartbeat` event, seed per-connection caches
+silently on connect (sending only still-open state such as pending questions), and upsert by id
+on the client so a replay is idempotent.
+
+## A commit hook that fails restores its backup over everyone's working tree
+
+Mid-session a failed `git commit` (the typecheck hook tripped on uninstalled electron deps)
+made lint-staged restore its automatic backup, silently reverting uncommitted edits other
+agents were making in the same checkout. Rules: never commit from a checkout another writer is
+editing — wait until every writer reports, then run the full verification, then commit; if a
+hook fails, check `git diff` of every in-flight file before anything else. When a dependency
+cannot be installed (egress 403), install the exact package from an allowed registry into the
+ignored `node_modules` **and apply the repo's `patches/` to it** — an unpatched stand-in made a
+security test fail for a reason that had nothing to do with the code.
+
+## A liveness signal nobody reads is not liveness
+
+`agent_runs.last_heartbeat` was written every 30s and read by nothing, so a hung worker kept its
+run `running` forever and a worker that died before recording its pid left a `pending` run no
+command could clear. A heartbeat is only half a mechanism; the sweep that acts on it is the other
+half, and it must run on every surface's read path (CLI, TUI, MCP, web), guarded on the exact
+`updated_at` it judged so a heartbeat landing mid-sweep wins.
+
+## A derived count must also derive "is it still running"
+
+The parallel-feature slot count read lifecycle only; a failed or stopped run leaves the
+lifecycle in a running phase, so every crash leaked a slot permanently. Derive occupancy from
+the current run's status in the same sub-select the atomic claim uses, and wire the queue drain
+to every event that frees a slot — including failure and stop, not only completion.
+
+## "Full local verification" means every script CI runs, not the four in the rule
+
+The spec 116 follow-up passed lint, format, typecheck, unit, integration and three builds locally,
+then went red twice in CI: `check:stories` rejected a grandfathered entry for a component that
+had just gained its story, and the Electron build rejected `tree-kill` because a core adapter
+started importing it and the Electron bundle includes core. Neither check is in the four-step
+rule, and both run in seconds. Rules: before pushing, grep `.github/workflows/*.yml` for every
+`pnpm run …` and run each one that can run locally (`check:stories`, `generate` with a clean
+diff, `node packages/electron/scripts/build.mjs`); a new third-party import in `packages/core`
+is also a `packages/electron/package.json` dependency; when adding a story, remove the
+component from `scripts/check-stories.mjs`'s grandfathered list in the same change.

@@ -119,7 +119,11 @@
       "nodeVersionLabel": "Versión de Node",
       "dbPathLabel": "Ruta de BD",
       "logFileLabel": "Archivo de registro",
-      "daemonConfigLabel": "Configuración del demonio"
+      "daemonConfigLabel": "Configuración del demonio",
+      "buildLabel": "Compilación",
+      "gitShaLabel": "SHA de Git",
+      "healthLabel": "Disponibilidad",
+      "osLabel": "SO"
     },
     "ui": {
       "description": "Iniciar la interfaz web de Shep",
@@ -385,7 +389,8 @@
         "agentResumed": "Agente de funcionalidad reanudado",
         "featureLabel": "Funcionalidad:",
         "runIdLabel": "ID de ejecución:",
-        "failedToResume": "Error al reanudar la funcionalidad"
+        "failedToResume": "Error al reanudar la funcionalidad",
+        "forceOption": "Reanudar aunque se haya alcanzado el límite de funcionalidades en paralelo"
       },
       "review": {
         "description": "Revisión interactiva de una funcionalidad en espera de aprobación",
@@ -815,6 +820,15 @@
           "empty": "No había plan de ejecución guardado para {{path}}",
           "failed": "No se pudo borrar el plan de ejecución"
         }
+      },
+      "approve": {
+        "description": "Revisar y aprobar los comandos de desarrollo del repositorio",
+        "fingerprintOption": "Aprobar solo esta huella de comandos revisada",
+        "invalid": "No hay un .shep/dev.json válido en {{path}}",
+        "review": "Revise estos comandos y repita el comando con --fingerprint {{fingerprint}}. La aprobación no los ejecuta.",
+        "changed": "La huella no coincide con la configuración actual. Revísela de nuevo antes de aprobar.",
+        "approved": "Comandos de desarrollo aprobados. Inicie el servidor cuando esté listo.",
+        "failed": "No se pudieron aprobar los comandos de desarrollo"
       }
     },
     "agent": {
@@ -1091,6 +1105,9 @@
       "noLogFile": "No se encontró archivo de registro para {{label}}",
       "expectedAt": "Esperado: {{path}}",
       "logEmpty": "El archivo de registro está vacío para {{label}}"
+    },
+    "agentGuard": {
+      "forceOption": "Ejecutar incluso dentro de una ejecución de agente de Shep, aunque detenga al agente que lo ejecuta"
     }
   },
   "bootstrap": {

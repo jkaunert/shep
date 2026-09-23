@@ -119,7 +119,11 @@
       "nodeVersionLabel": "גרסת Node",
       "dbPathLabel": "נתיב מסד נתונים",
       "logFileLabel": "קובץ יומן",
-      "daemonConfigLabel": "הגדרת תהליך"
+      "daemonConfigLabel": "הגדרת תהליך",
+      "buildLabel": "בילד",
+      "gitShaLabel": "Git SHA",
+      "healthLabel": "מוכנות",
+      "osLabel": "מערכת הפעלה"
     },
     "ui": {
       "description": "הפעל את ממשק ה-Web של Shep",
@@ -385,7 +389,8 @@
         "agentResumed": "סוכן הפיצ'ר חודש",
         "featureLabel": "פיצ'ר:",
         "runIdLabel": "מזהה הרצה:",
-        "failedToResume": "חידוש הפיצ'ר נכשל"
+        "failedToResume": "חידוש הפיצ'ר נכשל",
+        "forceOption": "המשך גם כאשר הושגה מגבלת הפיצ'רים המקבילים"
       },
       "review": {
         "description": "סקירה אינטראקטיבית של פיצ'ר הממתין לאישור",
@@ -815,6 +820,15 @@
           "empty": "לא הייתה תוכנית הרצה שמורה עבור {{path}}",
           "failed": "ניקוי תוכנית ההרצה נכשל"
         }
+      },
+      "approve": {
+        "description": "סקירה ואישור של פקודות הפיתוח במאגר",
+        "fingerprintOption": "אישור רק של טביעת האצבע שנבדקה",
+        "invalid": "אין קובץ .shep/dev.json תקין ב־{{path}}",
+        "review": "יש לבדוק את הפקודות ואז להריץ שוב עם --fingerprint {{fingerprint}}. האישור אינו מפעיל אותן.",
+        "changed": "טביעת האצבע אינה תואמת לתצורה הנוכחית. יש לבדוק אותה שוב לפני האישור.",
+        "approved": "פקודות הפיתוח אושרו. אפשר להפעיל את שרת הפיתוח כשמוכנים.",
+        "failed": "לא ניתן לאשר את פקודות הפיתוח"
       }
     },
     "agent": {
@@ -1091,6 +1105,9 @@
       "noLogFile": "לא נמצא קובץ יומן עבור {{label}}",
       "expectedAt": "צפוי ב: {{path}}",
       "logEmpty": "קובץ היומן ריק עבור {{label}}"
+    },
+    "agentGuard": {
+      "forceOption": "הרץ גם מתוך הרצת סוכן של Shep, למרות שהפעולה תעצור את הסוכן שמריץ אותה"
     }
   },
   "bootstrap": {

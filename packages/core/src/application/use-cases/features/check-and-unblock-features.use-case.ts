@@ -43,7 +43,10 @@ import { SpawnFeatureAgentUseCase } from './spawn-feature-agent.use-case.js';
 import { FeatureCapacityService } from './capacity/feature-capacity.service.js';
 
 /** Maximum time (ms) to wait for a single child rebase before aborting. */
-const REBASE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+export const REBASE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Sentinel the rebase timeout resolves with, so it never masquerades as a sync result. */
+const REBASE_TIMED_OUT = Symbol('rebase-timed-out');
 
 @injectable()
 export class CheckAndUnblockFeaturesUseCase {
@@ -85,17 +88,33 @@ export class CheckAndUnblockFeaturesUseCase {
       }
 
       // The dependency gate is open, but a machine slot is a separate question.
-      // With none free, the child leaves Blocked for the capacity queue rather
-      // than starting — AdmitQueuedFeaturesUseCase releases it when one frees.
-      if (!(await this.capacity.hasCapacity())) {
-        await this.featureRepo.update(markQueuedForCapacity(child));
+      // Taking the slot and transitioning are ONE statement, so this sweep
+      // cannot start a child that a `shep start` or a queue drain is starting
+      // at the same moment — that would be two workers in one worktree.
+      const now = new Date();
+      const claimed = await this.capacity.claimSlot({
+        featureId: child.id,
+        targetLifecycle: SdlcLifecycle.Started,
+        requireLifecycle: SdlcLifecycle.Blocked,
+        now,
+      });
+
+      if (!claimed) {
+        const fresh = await this.featureRepo.findById(child.id);
+        // Still Blocked means the cap refused it: the child leaves Blocked for
+        // the capacity queue rather than starting, and
+        // AdmitQueuedFeaturesUseCase releases it when a slot frees. Anything
+        // else means another process already moved it on.
+        if (fresh && fresh.lifecycle === SdlcLifecycle.Blocked) {
+          await this.featureRepo.update(markQueuedForCapacity(child, now));
+        }
         continue;
       }
 
-      // Transition to Started
+      // The claim already wrote the transition — mirror it in memory for the
+      // rebase and spawn below.
       child.lifecycle = SdlcLifecycle.Started;
-      child.updatedAt = new Date();
-      await this.featureRepo.update(child);
+      child.updatedAt = now;
       unblockedIds.push(child.id);
 
       // Rebase child branch onto parent branch (isolated per-child)
@@ -163,15 +182,36 @@ export class CheckAndUnblockFeaturesUseCase {
 
     const startMs = Date.now();
 
+    // The sync cannot be cancelled: timing out only stops WAITING for it, while
+    // git keeps running in the child's worktree. So a timeout is reported at
+    // once (the timeline shows the rebase is stuck), but this method — and so
+    // the agent spawn that follows it — still waits for the sync to settle.
+    // Spawning an agent into a worktree mid-rebase is what the old
+    // Promise.race did.
+    const sync = this.syncFeatureBranch.execute({
+      repositoryPath: child.repositoryPath,
+      branch: child.branch,
+      parentBranch: parent.branch,
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<typeof REBASE_TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(REBASE_TIMED_OUT), REBASE_TIMEOUT_MS);
+    });
+
     try {
-      await Promise.race([
-        this.syncFeatureBranch.execute({
-          repositoryPath: child.repositoryPath,
-          branch: child.branch,
-          parentBranch: parent.branch,
-        }),
-        this.createTimeout(REBASE_TIMEOUT_MS, child.branch),
-      ]);
+      const outcome = await Promise.race([sync, timedOut]);
+      if (outcome === REBASE_TIMED_OUT) {
+        await this.completeTiming(
+          agentRunId,
+          phaseTimingId,
+          startMs,
+          'error',
+          `Rebase timeout: ${child.branch} exceeded ${REBASE_TIMEOUT_MS}ms — ` +
+            'waiting for the git operation to finish before starting the agent'
+        );
+        await sync.catch(() => undefined);
+        return;
+      }
 
       // Rebase succeeded
       await this.completeTiming(agentRunId, phaseTimingId, startMs, 'success');
@@ -180,16 +220,9 @@ export class CheckAndUnblockFeaturesUseCase {
       // agent spawn proceeds regardless of rebase outcome
       const message = error instanceof Error ? error.message : String(error);
       await this.completeTiming(agentRunId, phaseTimingId, startMs, 'error', message);
+    } finally {
+      clearTimeout(timer);
     }
-  }
-
-  /**
-   * Create a timeout promise that rejects after the specified duration.
-   */
-  private createTimeout(ms: number, childBranch: string): Promise<never> {
-    return new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`Rebase timeout: ${childBranch} exceeded ${ms}ms`)), ms);
-    });
   }
 
   /**
